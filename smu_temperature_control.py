@@ -91,7 +91,7 @@ class SMUGUI(QWidget):
             try:
                 inst = rm.open_resource(addr)
                 idn = inst.query("*IDN?")
-                if "KEYSIGHT" in idn.upper() and "B2901A" in idn.upper():
+                if "KEYSIGHT" in idn.upper() and any(model in idn.upper() for model in ["B2901A", "B2901B"]):
                     print(f"Connected to: {idn.strip()}")
 
                     inst.timeout = 5000
@@ -241,7 +241,7 @@ class SMUGUI(QWidget):
             self.smu.write("OUTP ON")
 
             try:
-                low_current = 0.005  # 1 mA
+                low_current = 0.0005  # 1 mA
                 num_samples = 100
                 resistances = []
 
@@ -327,7 +327,7 @@ class SMUGUI(QWidget):
                 t0 = float(self.room_temp_input.text())
             except ValueError:
                 t0 = 22.0
-            temp = calculate_temperature(resistance, self.r0_measured, alpha=0.00381, t0=t0)
+            temp = calculate_temperature(resistance, self.r0_measured, alpha=0.002212, t0=t0)
         else:
             temp = np.nan
 
