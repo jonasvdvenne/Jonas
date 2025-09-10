@@ -7,7 +7,7 @@ import os
 
 
 class PulseAnalyzer:
-    def __init__(self, file_path, pulse_time=0.2, sample_rate=800, time_step=1.25, tcr=0.002212):
+    def __init__(self, file_path, pulse_time=0.1, sample_rate=800, time_step=1.25, tcr=0.002212):
         self.file_path = file_path
         self.pulse_time = pulse_time
         self.sample_rate = sample_rate
@@ -31,7 +31,7 @@ class PulseAnalyzer:
         self.analysis_mode = "slope"
 
         # Load data
-        self.time_data, self.resistance_data, self.full_temp_data, self.num_pulses, self.time_for_plotting = self._load_data()
+        self.time_data, self.resistance_data, self.full_temp_data, self.tsensor_data, self.num_pulses, self.time_for_plotting = self._load_data()
 
     # -----------------------------
     # Data Handling
@@ -57,11 +57,12 @@ class PulseAnalyzer:
         time_data = data[start_index:, 0]
         resistance_data = data[start_index:, 3]
         full_temp_data = self.resistance_to_temp(resistance_data, resistance_data[0])
+        tsensor_data = data[start_index:, 28].astype(float)
 
         num_pulses = len(time_data) // self.pulse_data
-        time_for_plotting = np.array([time_data[i * self.pulse_data] / 60 for i in range(num_pulses)])
+        time_for_plotting = np.array([time_data[i * self.pulse_data] for i in range(num_pulses)])
 
-        return time_data, resistance_data, full_temp_data, num_pulses, time_for_plotting
+        return time_data, resistance_data, full_temp_data, tsensor_data, num_pulses, time_for_plotting
 
     def resistance_to_temp(self, res_vector, R0):
         return ((res_vector / R0) - 1) / self.tcr
@@ -127,7 +128,7 @@ class PulseAnalyzer:
             if len(segment) == 0:
                 continue
             temp_segment = self.resistance_to_temp(segment, segment[0])
-            ax.plot(time_axis_ms, temp_segment, label=f"{self.time_for_plotting[idx]:.2f} min", color=colors[i])
+            ax.plot(time_axis_ms, temp_segment, label=f"{self.time_for_plotting[idx]:.2f} s", color=colors[i])
 
         ax.set_title("Overlapped Pulses at Different Times")
         ax.set_xlabel("Time (ms)")
@@ -136,10 +137,9 @@ class PulseAnalyzer:
         ax.grid(True)
 
     def setup_main_plot(self):
-        self.fig, self.axs = plt.subplots(2, 2, figsize=(12, 8))
+        self.fig, self.axs = plt.subplots(3, 2, figsize=(12, 12))  # Changed to 3x2 grid
         self.axs = self.axs.flatten()
         plt.subplots_adjust(right=0.75, hspace=0.4, wspace=0.3)
-
 
     def update_plot(self):
         if self.axs is None:
@@ -176,24 +176,31 @@ class PulseAnalyzer:
     
         # --- 4th plot: smoothed temperature trend ---
         smoothed_temp = np.convolve(
-            self.full_temp_data[: self.num_pulses * self.pulse_data : self.pulse_data],
+            self.tsensor_data[: self.num_pulses * self.pulse_data : self.pulse_data],
             np.ones(10) / 10,
             mode="same",
         )
         self.axs[3].scatter(self.time_for_plotting, smoothed_temp, s=10)
     
+        # --- 5th plot: raw temperature ---
+        self.axs[4].plot(self.time_data, self.tsensor_data, linewidth=1)
+    
+        # --- 6th plot: first data point of each pulse ---
+        first_points = self.tsensor_data[::self.pulse_data][:self.num_pulses]
+        self.axs[5].scatter(self.time_for_plotting, first_points, s=10)
+    
         # --- Titles and labels ---
         if self.analysis_mode == "slope":
-            titles = ["Slope Over Time", "Δ Slope (%)", "R²", "Temperature Trend"]
-            ylabels = ["Slope", "Change (%)", "R²", "Temp (°C)"]
+            titles = ["Slope Over Time", "Δ Slope (%)", "R²", "Smoothed Temperature Trend", "Raw Temperature", "First Pulse Temperature"]
+            ylabels = ["Slope", "Change (%)", "R²", "Temp (°C)", "Temp (°C)", "Temp (°C)"]
         else:
-            titles = ["Offset Over Time", "Δ Offset (%)", "R²", "Temperature Trend"]
-            ylabels = ["Offset", "Change (%)", "R²", "Temp (°C)"]
+            titles = ["Offset Over Time", "Δ Offset (%)", "R²", "Smoothed Temperature Trend", "Raw Temperature", "First Pulse Temperature"]
+            ylabels = ["Offset", "Change (%)", "R²", "Temp (°C)", "Temp (°C)", "Temp (°C)"]
     
         for ax, title, ylabel in zip(self.axs, titles, ylabels):
             ax.set_title(title)
             ax.set_ylabel(ylabel)
-            ax.set_xlabel("Time (min)")
+            ax.set_xlabel("Time (s)")
             ax.grid(True)
     
         if len(self.intervals) > 0:
@@ -204,7 +211,6 @@ class PulseAnalyzer:
             self.fig.canvas.draw_idle()
         except Exception:
             plt.draw()
-
 
     # -----------------------------
     # UI Controls 
@@ -249,7 +255,6 @@ class PulseAnalyzer:
         self.btn_remove.on_clicked(self._on_remove_button_clicked)
         self.btn_toggle.on_clicked(self._on_toggle_mode_clicked)
         self.btn_export.on_clicked(self._on_export_clicked)
-
 
     def _on_add_button_clicked(self, event):
         try:
@@ -299,12 +304,11 @@ class PulseAnalyzer:
         # Redraw empty plots
         self.update_plot()
     
-
     def _on_export_clicked(self, event):
         if self.last_offsets is None:
             return
         df = pd.DataFrame({
-            'time_min': self.time_for_plotting,
+            'time_s': self.time_for_plotting,
             'slope': self.last_slopes,
             'offset': self.last_offsets,
             'r2': self.last_r2,
@@ -325,6 +329,6 @@ class PulseAnalyzer:
 
 
 if __name__ == "__main__":
-    dataset_file = r"C:\Users\lucp12726\Documents\Heater pulsing condensates\250908_16h55m05s_250809_WATER_AIR.csv"
+    dataset_file = r"C:\Users\lucp12726\Documents\Heater pulsing condensates\250910_Heater_htm\250910_13h23m09s_small_and_big_heater_both_htm.csv"
     analyzer = PulseAnalyzer(dataset_file)
     analyzer.run()
