@@ -1,419 +1,544 @@
-import numpy as np
-import pyvisa
 import sys
 import time
-import math
+from math import isfinite
+
+import numpy as np
+import pyvisa
+
+from PyQt5.QtCore import QThread, QObject, pyqtSignal, QTimer, Qt
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QPushButton, QVBoxLayout,
-    QLineEdit, QLabel, QHBoxLayout, QGridLayout
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QComboBox
 )
-from PyQt5.QtCore import QThread, pyqtSignal, QObject
 import pyqtgraph as pg
 
 
+# =========================
+# Utility / domain helpers
+# =========================
+
+def safe_float(line_edit: QLineEdit, default: float) -> float:
+    try:
+        return float(line_edit.text())
+    except Exception:
+        return default
+
+
+def calculate_temperature(r, r0, alpha=0.00381, t0=22.0):
+    """PT-type linearized temp estimate from resistance."""
+    if r0 is None or r0 <= 0 or not isfinite(r0) or not isfinite(r) or r <= 0:
+        return np.nan
+    return (r / r0 - 1.0) / alpha + t0
+
+
+# =========================
+# VISA worker thread
+# =========================
+
 class SMUWorker(QObject):
-    data_ready = pyqtSignal(float, float, float, float)  # t, current, voltage, resistance
+    """
+    Runs in its own thread:
+      - Sets source current (with clamp & slew limit).
+      - Reads measured current & voltage.
+      - Computes resistance.
+      - Emits tuples for GUI.
+    """
+    data_ready = pyqtSignal(float, float, float, float)  # t, I_meas, V, R
     finished = pyqtSignal()
 
-    def __init__(self, smu, get_params_func):
+    def __init__(self, smu, get_target_current_func, max_current_clamp=0.52, max_slew_a_per_s=10.0):
         super().__init__()
         self.smu = smu
-        self.get_params = get_params_func
+        self.get_target_current = get_target_current_func  # callable returning desired I (A)
         self.running = False
-        self.latest_data = None
-        self.start_time = time.time()
+        self.start_time = None
+        self.latest_i_cmd = 0.0
+        self.max_current = float(max_current_clamp)
+        self.max_slew = float(max_slew_a_per_s)  # A/s
+        self.loop_dt = 0.02   # ~50 Hz I/O loop (fits 10 ms I & 10 ms V apertures comfortably)
 
-        
+    def _slew_limited(self, target_i, current_i, dt):
+        """Limit current change per loop to avoid big steps at the SMU output."""
+        max_delta = self.max_slew * dt
+        delta = np.clip(target_i - current_i, -max_delta, +max_delta)
+        return current_i + delta
+
     def start(self):
         self.running = True
-        while self.running:
-            try:
-                t = time.time() - self.start_time
-                
-                amp, freq, offset = self.get_params()
-                current = amp * math.sin(2 * math.pi * freq * t) + offset
-                current = max(0.0, min(current, 0.52))  # Clamp to 0–0.4 A
+        self.start_time = time.time()
 
-                self.smu.write(f"SOUR:CURR {current:.5f}")
+        # Ensure a defined small starting level at the instrument side
+        try:
+            self.smu.write(f"SOUR:CURR {0.0001:.6f}")
+        except Exception as e:
+            print("Worker init write failed:", e)
+
+        while self.running:
+            t = time.time() - self.start_time
+            try:
+                # 1) Fetch target from GUI (PID sets it); clamp it
+                i_target = float(self.get_target_current())
+                if not isfinite(i_target):
+                    i_target = 0.0
+                i_target = np.clip(i_target, 0.0, self.max_current)
+
+                # 2) Slew-limit the commanded current we send to the SMU
+                i_cmd = self._slew_limited(i_target, self.latest_i_cmd, self.loop_dt)
+                self.latest_i_cmd = i_cmd
+
+                # 3) Apply source current
+                self.smu.write(f"SOUR:CURR {i_cmd:.6f}")
+
+                # 4) Read measured I & V (use measured values for R)
+                #    Using one-shot queries keeps timing simple and stable on B2901.
+                self.smu.write("MEAS:CURR?")
+                i_meas = float(self.smu.read())
 
                 self.smu.write("MEAS:VOLT?")
-                voltage = float(self.smu.read())
+                v_meas = float(self.smu.read())
 
-                resistance = voltage / current if current > 0 else 0
+                r_meas = (v_meas / i_meas) if i_meas != 0 else np.nan
 
-                self.latest_data = (time.time() - self.start_time, current, voltage, resistance)
-
+                self.data_ready.emit(t, i_meas, v_meas, r_meas)
 
             except Exception as e:
                 print("Worker error:", e)
+                # break the loop; GUI will handle cleanup
                 self.running = False
+
+            time.sleep(self.loop_dt)
 
         self.finished.emit()
 
     def stop(self):
         self.running = False
 
-def calculate_temperature(r, r0, alpha=0.00381, t0=22.0):
-        if np.isnan(r) or r0 is None or np.isnan(r0) or r0 == 0:
-            return np.nan
-        return (r / r0 - 1.0) / alpha + t0
+
+# =========================
+# Main GUI
+# =========================
 
 class SMUGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SMU Current Control")
-        self.resize(1200, 600)
+        self.setWindowTitle("Keysight B2901 Temperature Control (4-wire, PID)")
+        self.resize(1280, 800)
 
-        self.smu = self.initialize_smu()
+        # Instrument & state
+        self.smu = self._init_smu()
+        self.worker = None
+        self.thread = None
 
-        self.currents = []
-        self.voltages = []
-        self.resistances = []
-        self.time_stamps = []
-        self.temperatures = []
-        self.error_sum = 0.0
-        self.heating_phase = "warmup"
-        self.dynamic_offset = 0.05
-        self.pid_integral = 0.0
-        self.pid_prev_error = 0.0
-        self.filtered_temps = []
-        self.stable_time = 0.0
-        self.temp_osc_target = 1.0  # degrees C
+        # Data buffers
+        self.t_buf, self.i_buf, self.v_buf, self.r_buf = [], [], [], []
+        self.temp_buf, self.temp_filter_buf = [], []
 
+        # Control / PID state
+        self.r0_measured = None
+        self.pid_int = 0.0
+        self.pid_prev_err = 0.0
 
+        # GUI / control defaults
+        self._default_max_current = 0.52      # A
+        self._warmup_current = 0.050          # A
+        self._temp_filter_window = 20         # samples for simple moving average
+        self._deriv_clip = 50.0               # °C/s cap for D-term
+        self._int_clip = 1000.0               # anti-windup clamp
 
+        self._build_ui()
+        self._wire_runtime()
 
-        self.init_ui()
+        # Thread-safe shadow setpoint (worker reads this, not the widget)
+        self._setpoint_value = self._warmup_current
 
-    def initialize_smu(self):
+    # ---------------- SMU init / config ----------------
+
+    def _init_smu(self):
         rm = pyvisa.ResourceManager()
         for addr in rm.list_resources():
             try:
                 inst = rm.open_resource(addr)
-                idn = inst.query("*IDN?")
-                if "KEYSIGHT" in idn.upper() and any(model in idn.upper() for model in ["B2901A", "B2901B"]):
-                    print(f"Connected to: {idn.strip()}")
+                idn = inst.query("*IDN?").strip()
+                if "KEYSIGHT" in idn.upper() and any(m in idn.upper() for m in ["B2901A", "B2901B"]):
+                    print(f"Connected to: {idn}")
 
+                    # VISA settings
                     inst.timeout = 5000
                     inst.write_termination = '\n'
                     inst.read_termination = '\n'
 
+                    # Known-good configuration sequence
                     inst.write("*RST")
                     inst.write("*CLS")
                     inst.write(":SOUR:FUNC:MODE CURR")
-                    inst.write(":SENS:CURR:PROT 1")
-                    inst.write("SOUR:CURR 0.0001")
-                    inst.write("SOUR:CURR:RANG 0.3")
-                    inst.write("SENS:VOLT:PROT 2")
-                    inst.write("SENS:VOLT:RANG 2")
-                    inst.write("SENS:REM ON")
-                    inst.write(":SENS:VOLT:APER 0.01")
-                    inst.write("SENS:CURR:RANG 0.4")
+
+                    # Ranges & compliance (manual, no auto)
+                    inst.write(":SENS:CURR:PROT 1")     # measurement current protect (harmless here)
+                    inst.write("SOUR:CURR 0.0001")       # small starting source
+                    inst.write("SOUR:CURR:RANG 0.3")     # source current range
+                    inst.write("SENS:VOLT:PROT 2")       # voltage compliance
+                    inst.write("SENS:VOLT:RANG 2")       # measure V range
+                    inst.write("SENS:REM ON")            # 4-wire sense
+                    inst.write(":SENS:VOLT:APER 0.01")   # aperture ~10ms
+                    inst.write("SENS:CURR:RANG 0.4")     # measure I range
                     inst.write(":SENS:CURR:APER 0.01")
-                    
-                    self.r0_measured = None
-                    
+
                     return inst
             except Exception as e:
                 print(f"Could not connect to {addr}: {e}")
+        print("No Keysight B2901 found.")
         return None
 
-    def reset_data(self):
-        # Clear data
-        self.time_stamps.clear()
-        self.currents.clear()
-        self.voltages.clear()
-        self.resistances.clear()
-        self.temperatures.clear()
-        self.heating_phase = "warmup"
-        self.dynamic_offset = 0.05
-        self.pid_integral = 0.0
-        self.pid_prev_error = 0.0
-        self.filtered_temps.clear()
-        self.stable_time = 0.0
-        self.temp_osc_target = 1.0  # degrees C
+    # ---------------- UI helpers ----------------
 
-        # Clear plots
-        self.curve_current.setData([], [])
-        self.curve_temperature.setData([], [])
+    def _row(self, label_text, widget):
+        row = QHBoxLayout()
+        lab = QLabel(label_text)
+        lab.setFixedWidth(220)
+        row.addWidget(lab)
+        row.addWidget(widget, 1)
+        return row
 
-        self.r0_label.setText("Initial R₀: -- Ω")
+    def _build_ui(self):
+        pg.setConfigOptions(antialias=True)
 
-    def init_ui(self):
         layout = QVBoxLayout()
 
-        layout.addWidget(QLabel("Room Temperature (°C)"))
-        self.room_temp_input = QLineEdit("22.0")
-        layout.addWidget(self.room_temp_input)
+        # --- Config & targets ---
+        self.room_temp = QLineEdit("22.0")
+        self.alpha = QLineEdit("0.00381")
+        self.target_temp = QLineEdit("37.5")
+        self.temp_band = QLineEdit("1.0")
 
-        def make_control_row(label_text, line_edit, step, min_val=None, max_val=None):
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label_text))
-            row.addWidget(line_edit)
+        self.r0_current = QLineEdit("0.005")     # 5 mA default for R0 measurement
+        self.r0_samples = QLineEdit("100")
+        self.r0_delay_s = QLineEdit("0.01")
 
-            btn_dec = QPushButton("–")
-            btn_inc = QPushButton("+")
-            row.addWidget(btn_dec)
-            row.addWidget(btn_inc)
+        self.max_current = QLineEdit(f"{self._default_max_current:.3f}")
+        self.volt_compliance = QLineEdit("2.0")
 
-            def update(delta):
-                try:
-                    val = float(line_edit.text())
-                    val += delta
-                    if min_val is not None:
-                        val = max(min_val, val)
-                    if max_val is not None:
-                        val = min(max_val, val)
-                    line_edit.setText(f"{val:.4f}")
-                except ValueError:
-                    pass
+        self.src_range = QComboBox(); self.src_range.addItems(["0.01","0.03","0.1","0.3","0.4","1.0"])
+        self.src_range.setCurrentText("0.3")
+        self.meas_i_range = QComboBox(); self.meas_i_range.addItems(["0.01","0.03","0.1","0.3","0.4","1.0"])
+        self.meas_i_range.setCurrentText("0.4")
+        self.meas_v_range = QComboBox(); self.meas_v_range.addItems(["0.2","2","20","200"])
+        self.meas_v_range.setCurrentText("2")
 
-            btn_dec.clicked.connect(lambda: update(-step))
-            btn_inc.clicked.connect(lambda: update(step))
+        layout.addLayout(self._row("Room Temperature (°C)", self.room_temp))
+        layout.addLayout(self._row("Alpha (1/°C)", self.alpha))
+        layout.addLayout(self._row("Target Temperature (°C)", self.target_temp))
+        layout.addLayout(self._row("Boundary Δ (°C)", self.temp_band))
 
-            return row
+        layout.addLayout(self._row("R₀ Measure Current (A)", self.r0_current))
+        layout.addLayout(self._row("R₀ Samples", self.r0_samples))
+        layout.addLayout(self._row("R₀ Sample Delay (s)", self.r0_delay_s))
 
-        # === Amplitude Row ===
-        self.amp_input = QLineEdit("0.1")
-        layout.addLayout(make_control_row("Amplitude (A)", self.amp_input, step=0.01, min_val=0, max_val=0.4))
+        layout.addLayout(self._row("Max Current Clamp (A)", self.max_current))
+        layout.addLayout(self._row("Compliance Voltage (V)", self.volt_compliance))
+        layout.addLayout(self._row("Source Current Range (A)", self.src_range))
+        layout.addLayout(self._row("Measure Current Range (A)", self.meas_i_range))
+        layout.addLayout(self._row("Measure Voltage Range (V)", self.meas_v_range))
 
-        # === Frequency Row ===
-        self.freq_input = QLineEdit("1.0")
-        layout.addLayout(make_control_row("Frequency (Hz)", self.freq_input, step=0.1, min_val=0.01))
-        
-        self.target_temp_input = QLineEdit("37.5")
-        layout.addLayout(make_control_row("Target Temperature (°C)", self.target_temp_input, step=0.1, min_val=0.01))
-        
-        # === Boundary Adjust Controls ===
-        self.boundary_delta = QLineEdit("1")  # initial delta for ±1°C
-        layout.addLayout(make_control_row("Boundary Δ (°C)", self.boundary_delta, step=0.1, min_val=0.01))
+        # --- PID control output (human-visible + editable) ---
+        self.current_setpoint = QLineEdit(f"{self._warmup_current:.6f}")
+        layout.addLayout(self._row("Current Setpoint (A) [PID output]", self.current_setpoint))
 
-        # === Labels and Buttons ===
-        self.r0_label = QLabel("Initial R₀: -- Ω")
-        layout.addWidget(self.r0_label)
-        self.temp_label = QLabel("Measured Temp: -- °C")
-        layout.addWidget(self.temp_label)
+        # --- Buttons ---
+        btn_row = QHBoxLayout()
+        self.btn_update = QPushButton("Apply SMU Settings")
+        self.btn_r0 = QPushButton("Measure R₀")
+        self.btn_toggle = QPushButton("Start Output"); self.btn_toggle.setCheckable(True)
+        self.btn_reset = QPushButton("Reset Plots")
+        btn_row.addWidget(self.btn_update)
+        btn_row.addWidget(self.btn_r0)
+        btn_row.addWidget(self.btn_toggle)
+        btn_row.addWidget(self.btn_reset)
+        layout.addLayout(btn_row)
 
+        # --- Status labels ---
+        self.lab_r0 = QLabel("R₀: -- Ω")
+        self.lab_temp = QLabel("Filtered Temp: -- °C")
+        self.lab_iv = QLabel("I_meas: -- A | V_meas: -- V")
+        for lab in (self.lab_r0, self.lab_temp, self.lab_iv):
+            lab.setStyleSheet("font-weight: bold")
+            layout.addWidget(lab)
 
-        
-        self.toggle_btn = QPushButton("Start Output")
-        self.toggle_btn.setCheckable(True)
-        self.toggle_btn.clicked.connect(self.toggle_output)
-        layout.addWidget(self.toggle_btn)
-        
-        self.reset_btn = QPushButton("Reset")
-        self.reset_btn.clicked.connect(self.reset_data)
-        layout.addWidget(self.reset_btn)
+        # --- Plots ---
+        self.plot_i = pg.PlotWidget(title="Sourced Current (A)")
+        self.plot_i.setBackground('w')
+        self.curve_i = self.plot_i.plot([], [], pen=pg.mkPen('black', width=2))
+        layout.addWidget(self.plot_i)
 
-        # Current Plot (Blue)
-        self.plot_current = pg.PlotWidget(title="Sourced Current (A)")
-        self.plot_current.setBackground('w')
-        self.curve_current = self.plot_current.plot([], [], pen=pg.mkPen('black', width=2))
-        layout.addWidget(self.plot_current)
+        self.plot_t = pg.PlotWidget(title="Temperature (°C)")
+        self.plot_t.setBackground('w')
+        self.curve_t = self.plot_t.plot([], [], pen=pg.mkPen('blue', width=2))
+        self.line_target = pg.InfiniteLine(angle=0, pen=pg.mkPen('black', style=Qt.DashLine))
+        self.line_upper = pg.InfiniteLine(angle=0, pen=pg.mkPen('red'))
+        self.line_lower = pg.InfiniteLine(angle=0, pen=pg.mkPen('red'))
+        self.plot_t.addItem(self.line_target); self.plot_t.addItem(self.line_upper); self.plot_t.addItem(self.line_lower)
+        layout.addWidget(self.plot_t)
 
-
-        # Temperature Plot (Magenta on white background)
-        self.plot_temperature = pg.PlotWidget(title="Temperature (°C)")
-        self.plot_temperature.setBackground('w')
-        self.curve_temperature = self.plot_temperature.plot([], [], pen=pg.mkPen('blue', width=2))
-
-        # Main target line
-        self.target_temp_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('black', style=pg.QtCore.Qt.DashLine))
-        self.plot_temperature.addItem(self.target_temp_line)
-
-        # Upper bound line (+1°C)
-        self.upper_temp_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('red'))
-        self.plot_temperature.addItem(self.upper_temp_line)
-
-        # Lower bound line (–1°C)
-        self.lower_temp_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('red'))
-        self.plot_temperature.addItem(self.lower_temp_line)
-        
-        layout.addWidget(self.plot_temperature)
-
+        # Finalize
         self.setLayout(layout)
 
-    def toggle_output(self):
+        # GUI update timer (reads worker data and runs PID @ 10 Hz)
+        self.gui_timer = QTimer(self)
+        self.gui_timer.setInterval(100)
+        self.gui_timer.timeout.connect(self._on_gui_tick)
+
+    def _wire_runtime(self):
+        self.btn_update.clicked.connect(self._apply_smu_settings)
+        self.btn_r0.clicked.connect(self._measure_r0)
+        self.btn_toggle.clicked.connect(self._toggle_output)
+        self.btn_reset.clicked.connect(self._reset_plots)
+        # keep shadow setpoint in sync with the UI (block loops handled in setter)
+        self.current_setpoint.textEdited.connect(self._on_setpoint_edited)
+
+    # ---------------- Thread-safe setpoint helpers ----------------
+
+    def _set_setpoint(self, value: float):
+        """Update both the shadow setpoint and the UI box (signals blocked)."""
+        max_i = safe_float(self.max_current, self._default_max_current)
+        value = float(np.clip(value, 0.0, max_i))
+        self._setpoint_value = value
+        self.current_setpoint.blockSignals(True)
+        self.current_setpoint.setText(f"{value:.6f}")
+        self.current_setpoint.blockSignals(False)
+
+    def _on_setpoint_edited(self, text: str):
+        """When user edits the box, keep the shadow setpoint in sync."""
+        try:
+            val = float(text)
+        except Exception:
+            return
+        max_i = safe_float(self.max_current, self._default_max_current)
+        self._setpoint_value = float(np.clip(val, 0.0, max_i))
+
+    # ---------------- SMU settings ----------------
+
+    def _apply_smu_settings(self):
         if not self.smu:
             return
-        print(self.toggle_btn.isChecked())
-        if self.toggle_btn.isChecked():
+        try:
+            vprot = safe_float(self.volt_compliance, 2.0)
+            self.smu.write(":SOUR:FUNC CURR")
+            self.smu.write(f":SOUR:CURR:RANG {float(self.src_range.currentText())}")
+            self.smu.write(f":SENS:CURR:RANG {float(self.meas_i_range.currentText())}")
+            self.smu.write(f":SENS:VOLT:RANG {float(self.meas_v_range.currentText())}")
+            self.smu.write(f":SENS:VOLT:PROT {vprot}")
+            self.smu.write(":SENS:VOLT:APER 0.01")
+            self.smu.write(":SENS:CURR:APER 0.01")
+            self.smu.write(":SENS:CURR:PROT 1")
+            self.smu.write("SENS:REM ON")
+            print("SMU settings applied.")
+        except Exception as e:
+            print("Failed to apply SMU settings:", e)
+
+    # ---------------- R0 measurement ----------------
+
+    def _measure_r0(self):
+        if not self.smu:
+            return
+        try:
+            i_r0 = safe_float(self.r0_current, 0.005)
+            n = int(safe_float(self.r0_samples, 100))
+            dly = max(safe_float(self.r0_delay_s, 0.01), 0.002)
+
+            print(f"Measuring R0 at {i_r0} A, {n} samples, delay {dly}s")
             self.smu.write("OUTP ON")
+            self.smu.write(f"SOUR:CURR {i_r0:.6f}")
 
-            try:
-                low_current = 0.0005  # 1 mA
-                num_samples = 100
-                resistances = []
+            vals = []
+            for _ in range(n):
+                # Always use measured current for resistance
+                self.smu.write("MEAS:CURR?")
+                i_meas = float(self.smu.read())
+                self.smu.write("MEAS:VOLT?")
+                v_meas = float(self.smu.read())
+                if isfinite(i_meas) and i_meas > 0:
+                    vals.append(v_meas / i_meas)
+                time.sleep(dly)
 
-                self.smu.write(f"SOUR:CURR {low_current}")
-
-                for _ in range(num_samples):
-                    self.smu.write("MEAS:CURR?")
-                    i = float(self.smu.read())
-                    self.smu.write("MEAS:VOLT?")
-                    v = float(self.smu.read())
-
-                    if i > 0:
-                        r = v / i
-                        resistances.append(r)
-                    time.sleep(0.01)
-
-                if resistances:
-                    self.r0_measured = sum(resistances) / len(resistances)
-                    self.r0_label.setText(f"Initial R₀: {self.r0_measured:.4f} Ω")
+            if vals:
+                r0 = float(np.mean(vals))
+                if isfinite(r0) and r0 > 0:
+                    self.r0_measured = r0
+                    self.lab_r0.setText(f"R₀: {r0:.4f} Ω")
+                    print(f"R0 measured: {r0:.6f} Ω")
                 else:
+                    print("Invalid R0 result.")
                     self.r0_measured = None
-                    print("No valid resistance measurements collected.")
-
-            except Exception as e:
-                print("Initial R0 measurement failed:", e)
+            else:
+                print("No valid R0 samples.")
                 self.r0_measured = None
 
-            self.start_time = time.time()
-            self.start_thread()
-            self.toggle_btn.setText("Stop Output")
+        except Exception as e:
+            print("R0 measurement failed:", e)
 
-        else:
-            self.smu.write("OUTP OFF")
-            self.stop_thread()
-            self.toggle_btn.setText("Start Output")
+        finally:
+            # Critical: turn OFF and reset setpoint so the loop never sticks at i_r0
+            try:
+                self.smu.write("OUTP OFF")
+            except Exception:
+                pass
+            self._set_setpoint(self._warmup_current)  # warmup start
 
-    def start_thread(self):
-        self.worker = SMUWorker(
-            smu=self.smu,
-            get_params_func=self.get_wave_params
-        )
-        self.thread = QThread()
-        self.worker.moveToThread(self.thread)
-        
-        self.update_timer = pg.QtCore.QTimer()
-        self.update_timer.setInterval(16)  # 100 ms update rate
-        self.update_timer.timeout.connect(self.handle_data)
-        self.update_timer.start()
-        
-        self.thread.started.connect(self.worker.start)
-        self.worker.finished.connect(self.update_timer.stop)
+    # ---------------- Start/stop output ----------------
 
-        self.thread.start()
-
-    def stop_thread(self):
-        if hasattr(self, 'worker'):
-            self.worker.stop()
-            self.thread.quit()
-            self.thread.wait()
-    
-    def get_wave_params(self):
-        try:
-            amp = float(self.amp_input.text())
-            freq = float(self.freq_input.text())
-        except ValueError:
-            amp, freq = 0.0, 0.0
-
-        # Only return sine if allowed
-        if self.heating_phase == "regulate":
-            return amp, freq, self.dynamic_offset
-        else:
-            return 0.0, 0.0, self.dynamic_offset  # No sine wave yet
- 
-    def handle_data(self):
-        if not hasattr(self.worker, "latest_data") or self.worker.latest_data is None:
+    def _toggle_output(self):
+        if not self.smu:
             return
 
-        t, current, voltage, resistance = self.worker.latest_data 
+        if self.btn_toggle.isChecked():
+            if self.r0_measured is None:
+                print("⚠ Please measure R₀ first.")
+                self.btn_toggle.setChecked(False)
+                return
 
-        # Calculate temperature
-        if self.r0_measured:
-            try:
-                t0 = float(self.room_temp_input.text())
-            except ValueError:
-                t0 = 22.0
-            temp = calculate_temperature(resistance, self.r0_measured, alpha=0.002212, t0=t0)
+            # Reset PID state & start from warmup
+            self.pid_int = 0.0
+            self.pid_prev_err = 0.0
+            self._set_setpoint(self._warmup_current)
+
+            # Worker clamp from UI
+            max_i = safe_float(self.max_current, self._default_max_current)
+            self.smu.write("OUTP ON")
+
+            # Start worker thread (NOTE: worker reads the shadow float, not the QLineEdit)
+            self.worker = SMUWorker(
+                smu=self.smu,
+                get_target_current_func=lambda: self._setpoint_value,
+                max_current_clamp=max_i,
+                max_slew_a_per_s=10.0,
+            )
+            self.thread = QThread()
+            self.worker.moveToThread(self.thread)
+            self.thread.started.connect(self.worker.start)
+            self.worker.data_ready.connect(self._on_worker_data)  # connect here
+            self.worker.finished.connect(self.gui_timer.stop)
+            self.worker.finished.connect(lambda: self.smu.write("OUTP OFF"))
+            self.thread.start()
+
+            # Start the GUI timer that runs PID & plots
+            self.gui_timer.start()
+            self.btn_toggle.setText("Stop Output")
+            print("Output started.")
+
         else:
-            temp = np.nan
+            # Stop
+            try:
+                if self.worker:
+                    self.worker.stop()
+                if self.thread:
+                    self.thread.quit()
+                    self.thread.wait()
+                if self.smu:
+                    self.smu.write("OUTP OFF")
+            except Exception:
+                pass
+            self.gui_timer.stop()
+            self.btn_toggle.setText("Start Output")
+            print("Output stopped.")
 
-        # Target temp
-        try:
-            target_temp = float(self.target_temp_input.text())
-            self.target_temp_line.setPos(target_temp)
-            self.upper_temp_line.setPos(target_temp + float(self.boundary_delta.text()))
-            self.lower_temp_line.setPos(target_temp - float(self.boundary_delta.text()))
+    # ---------------- GUI tick: PID placeholder ----------------
 
-        except ValueError:
-            target_temp = 50.0
+    def _on_gui_tick(self):
+        # PID & plotting happen when worker emits data; timer exists to keep cadence
+        pass
 
-        # Filter temp
-        self.filtered_temps.append(temp)
-        if len(self.filtered_temps) > 100:
-            self.filtered_temps.pop(0)
-        base_temp = np.mean(self.filtered_temps)
+    # ---------------- Data handler: PID + plotting ----------------
 
-        error = target_temp - base_temp
-        dt = 0.016  # ~60Hz update rate
+    def _on_worker_data(self, t, i_meas, v_meas, r_meas):
+        # 1) Compute temperature
+        t0 = safe_float(self.room_temp, 22.0)
+        alpha = safe_float(self.alpha, 0.00381)
+        temp = calculate_temperature(r_meas, self.r0_measured, alpha=alpha, t0=t0)
 
+        # 2) Update filter
+        self.temp_filter_buf.append(temp)
+        if len(self.temp_filter_buf) > self._temp_filter_window:
+            self.temp_filter_buf.pop(0)
+        valid = [x for x in self.temp_filter_buf if isfinite(x)]
+        base_temp = float(np.mean(valid)) if valid else np.nan
 
-        if self.heating_phase == "warmup":
-            self._apply_pid(error, dt)
+        # 3) Update target/limit lines
+        tgt = safe_float(self.target_temp, 37.5)
+        band = abs(safe_float(self.temp_band, 1.0))
+        self.line_target.setPos(tgt)
+        self.line_upper.setPos(tgt + band)
+        self.line_lower.setPos(tgt - band)
 
-            if abs(error) <= 0.5:
-                self.stable_time += dt
+        # 4) PID: warm-up until temp is valid, then regulate
+        if not isfinite(base_temp):
+            # force warmup current
+            self._set_setpoint(self._warmup_current)
+        else:
+            err = tgt - base_temp
+            dt = max(1e-6, self.gui_timer.interval() / 1000.0)
+
+            # Simple gain scheduling
+            if abs(err) > 10:
+                Kp, Ki, Kd = 0.0010, 0.00010, 0.00050
+            elif abs(err) > 5:
+                Kp, Ki, Kd = 0.0006, 0.00005, 0.00030
             else:
-                self.stable_time = 0.0
+                Kp, Ki, Kd = 0.0003, 0.00002, 0.00010
 
-            if self.stable_time >= 6.0:
-                print("Entering regulation (sine) phase...")
-                self.heating_phase = "regulate"
+            # PID terms with anti-windup and derivative clamp
+            self.pid_int = float(np.clip(self.pid_int + err * dt, -self._int_clip, self._int_clip))
+            d = np.clip((err - self.pid_prev_err) / dt, -self._deriv_clip, self._deriv_clip)
+            adj = Kp * err + Ki * self.pid_int + Kd * d
 
-        elif self.heating_phase == "regulate":
-            self._apply_pid(error, dt)
-            
-        if self.heating_phase == "regulate":
-            self._apply_pid(error, dt)
+            # Setpoint update (clamped in setter; worker also clamps and slew-limits)
+            i_new = max(0.0, self._setpoint_value + adj)
+            self._set_setpoint(i_new)
+            self.pid_prev_err = err
 
-        self.temp_label.setText(f"Offset Temp: {base_temp:.2f} °C")
+        # 5) Buffers & plots
+        self.t_buf.append(t); self.i_buf.append(i_meas); self.v_buf.append(v_meas); self.r_buf.append(r_meas); self.temp_buf.append(temp)
+        MAX = 2000
+        if len(self.t_buf) > MAX:
+            self.t_buf = self.t_buf[-MAX:]
+            self.i_buf = self.i_buf[-MAX:]
+            self.v_buf = self.v_buf[-MAX:]
+            self.r_buf = self.r_buf[-MAX:]
+            self.temp_buf = self.temp_buf[-MAX:]
 
-        self._update_plots_and_store(t, current, voltage, resistance, temp)
+        self.curve_i.setData(self.t_buf, self.i_buf)
+        self.curve_t.setData(self.t_buf, self.temp_buf)
 
-    def _apply_pid(self, error, dt):
-        # Dynamic gain tuning
-        if abs(error) > 7:
-            print('A')
-            self.Kp, self.Ki, self.Kd = 0.00028, 0.00002, 0.00024
-        elif abs(error) > 4.5:
-            self.Kp, self.Ki, self.Kd = 0.00028, 0.00002, 0.00024
-            print('B')
-        elif abs(error) > 0.5:
-            self.Kp, self.Ki, self.Kd = 0.0001, 0.000, 0.0001
-            print('C')
+        # 6) Labels
+        self.lab_iv.setText(f"I_meas: {i_meas:.6f} A | V_meas: {v_meas:.6f} V")
+        if isfinite(base_temp):
+            self.lab_temp.setText(f"Filtered Temp: {base_temp:.2f} °C")
+        else:
+            self.lab_temp.setText("Filtered Temp: -- °C")
 
-        # PID terms
-        self.pid_integral += error * dt
-        max_derivative = 30  # or some appropriate value
-        derivative = np.clip((error - self.pid_prev_error) / dt, -max_derivative, max_derivative)
+    # ---------------- Misc UI actions ----------------
 
-        adjustment = self.Kp * error + self.Ki * self.pid_integral + self.Kd * derivative
+    def _reset_plots(self):
+        self.t_buf.clear(); self.i_buf.clear(); self.v_buf.clear(); self.r_buf.clear(); self.temp_buf.clear()
+        self.temp_filter_buf.clear()
+        self.curve_i.setData([], [])
+        self.curve_t.setData([], [])
 
-        self.dynamic_offset += adjustment
-        self.dynamic_offset = max(0.001, min(self.dynamic_offset, 0.5))
+    # Ensure we shut down cleanly
+    def closeEvent(self, event):
+        try:
+            if self.worker:
+                self.worker.stop()
+            if self.thread:
+                self.thread.quit()
+                self.thread.wait(1000)
+            if self.smu:
+                self.smu.write("OUTP OFF")
+        except Exception:
+            pass
+        super().closeEvent(event)
 
-        self.pid_prev_error = error
-        
-    def _update_plots_and_store(self, t, current, voltage, resistance, temp):
-        self.temperatures.append(temp)
-        self.time_stamps.append(t)
-        self.currents.append(current)
-        self.voltages.append(voltage)
-        self.resistances.append(resistance)
 
-        MAX_POINTS = 1000
-        self.time_stamps = self.time_stamps[-MAX_POINTS:]
-        self.currents = self.currents[-MAX_POINTS:]
-        self.voltages = self.voltages[-MAX_POINTS:]
-        self.resistances = self.resistances[-MAX_POINTS:]
-        self.temperatures = self.temperatures[-MAX_POINTS:]
+# ============ Application ============
 
-        self.curve_temperature.setData(self.time_stamps, self.temperatures)
-        self.curve_current.setData(self.time_stamps, self.currents)
-        
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     gui = SMUGUI()
