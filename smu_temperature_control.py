@@ -94,7 +94,7 @@ class SMUWorker(QObject):
         self.max_current = float(max_current_clamp)
         self.min_current = float(min_current_floor)
         self.max_slew = float(max_slew_a_per_s)
-        self.loop_dt = 0.02  # ~50 Hz
+        self.loop_dt = 0.015  # ~50 Hz
 
     def _slew_limited(self, target_i, current_i, dt):
         max_delta = self.max_slew * dt
@@ -166,7 +166,7 @@ class SMUGUI(QWidget):
 
         self._default_max_current = 0.52
         self._warmup_current = 0.050
-        self._temp_filter_window = 20
+        self._temp_filter_window = 10
         self._deriv_clip = 50.0
         self._int_clip = 1000.0
 
@@ -174,9 +174,16 @@ class SMUGUI(QWidget):
 
         # pulse manager + control flags
         self.pulse_manager = PulseManager()
-        self._pulse_paused = True            # paused by default (matches initial label)
-        self._pulse_manual_override = None   # None=auto, True=force paused, False=force enabled
-        self._active_target_temp = 37.5      # confirmed target
+        self._pulse_paused = True
+        self._pulse_manual_override = None
+        self._active_target_temp = 37.5
+
+        # First-pulse settling and post-pulse handling
+        self._band_entry_time = None      # when we entered band
+        self._pulses_started = False      # has the first pulse been allowed
+        self._last_pulse_event_ts = 0.0   # last pulse start/end timestamp
+        self._post_pulse_cooldown_s = 1.0 # lighten derivative for this long after pulse
+        self._post_pulse_drop_limit = 0.02  # A per control update (soft clamp)
 
         self._build_ui()
         self._wire_runtime()
@@ -265,7 +272,7 @@ class SMUGUI(QWidget):
         self.btn_update = QPushButton("Apply Settings")
         self.btn_r0 = QPushButton("Measure R₀")
         self.btn_toggle = QPushButton("Start Output"); self.btn_toggle.setCheckable(True)
-        self.btn_pulse_toggle = QPushButton("Resume Pulses")   # starts paused by default
+        self.btn_pulse_toggle = QPushButton("Resume Pulses")
         self.btn_reset = QPushButton("Reset Plots")
         for b in (self.btn_update, self.btn_r0, self.btn_toggle, self.btn_pulse_toggle, self.btn_reset):
             btns.addWidget(b)
@@ -298,7 +305,7 @@ class SMUGUI(QWidget):
         self.btn_update.clicked.connect(self._apply_smu_settings)
         self.btn_r0.clicked.connect(self._measure_r0)
         self.btn_toggle.clicked.connect(self._toggle_output)
-        self.btn_pulse_toggle.clicked.connect(self._toggle_pulses)  # manual override
+        self.btn_pulse_toggle.clicked.connect(self._toggle_pulses)
         self.btn_reset.clicked.connect(self._reset_plots)
         self.current_setpoint.textEdited.connect(self._on_setpoint_edited)
 
@@ -312,17 +319,17 @@ class SMUGUI(QWidget):
                 QMessageBox.Yes | QMessageBox.No
             )
             if reply == QMessageBox.No:
-                # revert back
                 self.target_temp.setText(f"{self._active_target_temp:.2f}")
                 return
-        # confirmed: pause pulses automatically while re-acquiring setpoint (unless user forces override)
         self._active_target_temp = new_target
+        # re-gate first pulse after a setpoint change (auto mode only)
         if self._pulse_manual_override is None:
             self._pulse_paused = True
+            self._pulses_started = False
+            self._band_entry_time = None
 
     # ---------------- Toggle pulses manually ----------------
     def _toggle_pulses(self):
-        # Flip manual override: None->True (pause), True->False (enable), False->True (pause)
         if self._pulse_manual_override is None:
             self._pulse_manual_override = True
         elif self._pulse_manual_override is True:
@@ -330,19 +337,16 @@ class SMUGUI(QWidget):
         else:
             self._pulse_manual_override = True
 
-        # Apply the effective state immediately
         if self._pulse_manual_override is True:
             self._pulse_paused = True
             self.btn_pulse_toggle.setText("Resume Pulses")
             self.lab_pulse.setText("Pulses: Paused (manual)")
             self.lab_pulse.setStyleSheet("font-weight:bold; color: red")
-            print("Pulses manually paused.")
         else:
             self._pulse_paused = False
             self.btn_pulse_toggle.setText("Pause Pulses")
             self.lab_pulse.setText("Pulses: Active (manual)")
             self.lab_pulse.setStyleSheet("font-weight:bold; color: green")
-            print("Pulses manually resumed.")
 
     # ---------------- Settings ----------------
     def _apply_smu_settings(self):
@@ -432,31 +436,83 @@ class SMUGUI(QWidget):
     # ---------------- Tick ----------------
     def _on_gui_tick(self): pass
 
-    def _on_worker_data(self,t,i_meas,v_meas,r_meas):
-        t0=safe_float(self.room_temp,22.0); alpha=safe_float(self.alpha,0.00381)
-        temp=calculate_temperature(r_meas,self.r0_measured,alpha,t0)
+    def _on_worker_data(self, t, i_meas, v_meas, r_meas):
+        # --- Temperature calculation & filtering ---
+        t0 = safe_float(self.room_temp, 22.0)
+        alpha = safe_float(self.alpha, 0.00381)
+        temp = calculate_temperature(r_meas, self.r0_measured, alpha, t0)
+
         self.temp_filter_buf.append(temp)
-        if len(self.temp_filter_buf)>self._temp_filter_window:self.temp_filter_buf.pop(0)
-        valid=[x for x in self.temp_filter_buf if isfinite(x)]
-        base_temp=float(np.mean(valid)) if valid else np.nan
-        tgt=self._active_target_temp
-        band=abs(safe_float(self.temp_band,1.0))
+        if len(self.temp_filter_buf) > self._temp_filter_window:
+            self.temp_filter_buf.pop(0)
+        valid = [x for x in self.temp_filter_buf if isfinite(x)]
+        base_temp = float(np.mean(valid)) if valid else np.nan
+
+        tgt = self._active_target_temp
+        band = abs(safe_float(self.temp_band, 1.0))
         self.line_target.setPos(tgt); self.line_upper.setPos(tgt+band); self.line_lower.setPos(tgt-band)
 
+        # --- PID controller with post-pulse protection ---
         if not isfinite(base_temp):
-            self._set_setpoint(max(self._warmup_current,self.r0_current_used))
+            self._set_setpoint(max(self._warmup_current, self.r0_current_used))
         else:
-            err=tgt-base_temp; dt=max(1e-6,self.gui_timer.interval()/1000.0)
-            if abs(err)>10:Kp,Ki,Kd=0.0020,0.00010,0.001
-            elif abs(err)>5:Kp,Ki,Kd=0.0008,0.00005,0.0006
-            else:Kp,Ki,Kd=0.0003,0.0,0.00040
-            self.pid_int=float(np.clip(self.pid_int+err*dt,-self._int_clip,self._int_clip))
-            d=np.clip((err-self.pid_prev_err)/dt,-self._deriv_clip,self._deriv_clip)
-            adj=Kp*err+Ki*self.pid_int+Kd*d
-            i_new=max(self.r0_current_used,self._setpoint_value+adj)
-            self._set_setpoint(i_new); self.pid_prev_err=err
+            if not hasattr(self, "_last_time"): self._last_time = t
+            dt = max(1e-6, t - self._last_time); self._last_time = t
 
-        # Determine effective pause state (manual override wins)
+            err = tgt - base_temp
+
+            # Gain scheduling
+            if abs(err) > 10:
+                Kp, Ki, Kd = 0.00120, 0.00002, 0.0012
+            elif abs(err) > 5:
+                Kp, Ki, Kd = 0.00080, 0.00002, 0.00090
+            else:
+                Kp, Ki, Kd = 0.00035, 0.000001, 0.00045
+
+            # Post-pulse: soften derivative to avoid undershoot
+            kd_scale = 1.0
+            if (t - self._last_pulse_event_ts) <= self._post_pulse_cooldown_s:
+                kd_scale = 0.05  # 20% derivative while cooling down
+
+            # integral with anti-windup
+            max_i = safe_float(self.max_current, self._default_max_current)
+            if self.r0_current_used < self._setpoint_value < max_i:
+                self.pid_int = float(np.clip(self.pid_int + err * dt, -self._int_clip, self._int_clip))
+
+            # derivative on measurement with simple low-pass
+            dT = (base_temp - getattr(self, "_last_temp", base_temp)) / dt
+            self._last_temp = base_temp
+            alpha_f = 0.3
+            if not hasattr(self, "_dT_filt"): self._dT_filt = dT
+            else: self._dT_filt = (1 - alpha_f) * self._dT_filt + alpha_f * dT
+            d = -np.clip(self._dT_filt, -self._deriv_clip, self._deriv_clip)
+
+            adj = Kp * err + Ki * self.pid_int + (Kd * kd_scale) * d
+
+            # Soft clamp on negative step immediately after pulses to prevent big drops
+            proposed = self._setpoint_value + adj
+            if (t - self._last_pulse_event_ts) <= self._post_pulse_cooldown_s:
+                min_allowed = self._setpoint_value - self._post_pulse_drop_limit
+                if proposed < min_allowed:
+                    proposed = min_allowed
+
+            i_new = max(self.r0_current_used, proposed)
+            self._set_setpoint(i_new)
+            self.pid_prev_err = err
+
+        # --- First-pulse gating: must be within band for ≥5 s (auto mode only) ---
+        if self._pulse_manual_override is None and not self._pulses_started and isfinite(base_temp):
+            if abs(base_temp - tgt) <= band:
+                if self._band_entry_time is None:
+                    self._band_entry_time = time.time()
+                elif time.time() - self._band_entry_time >= 5.0:
+                    self._pulse_paused = False
+                    self._pulses_started = True
+                    self.btn_pulse_toggle.setText("Pause Pulses")
+            else:
+                self._band_entry_time = None  # left the band -> reset timer
+
+        # --- Pulse logic & status ---
         if self._pulse_manual_override is True:
             effective_paused = True
         elif self._pulse_manual_override is False:
@@ -464,30 +520,27 @@ class SMUGUI(QWidget):
         else:
             effective_paused = self._pulse_paused
 
-        # pulse control + status label
         if not effective_paused and self.pulse_manager.enabled:
-            i_pulse=self.pulse_manager.get_pulse_current(self.r0_measured)
-            if i_pulse>0:
-                self._set_setpoint(self._setpoint_value+i_pulse)
-            # show status (if manual override, mark it)
-            if self._pulse_manual_override is False:
-                self.lab_pulse.setText("Pulses: Active (manual)")
-            else:
-                self.lab_pulse.setText("Pulses: Active")
+            before = self.pulse_manager._pulse_active
+            i_pulse = self.pulse_manager.get_pulse_current(self.r0_measured)
+            after = self.pulse_manager._pulse_active
+
+            # Detect pulse start/end to update cooldown timestamp
+            if after and not before:
+                self._last_pulse_event_ts = t
+            if (not after) and before:
+                self._last_pulse_event_ts = t
+
+            if i_pulse > 0:
+                self._set_setpoint(self._setpoint_value + i_pulse)
+
+            self.lab_pulse.setText("Pulses: Active" + (" (manual)" if self._pulse_manual_override is False else ""))
             self.lab_pulse.setStyleSheet("font-weight:bold; color: green")
         else:
-            if self._pulse_manual_override is True:
-                self.lab_pulse.setText("Pulses: Paused (manual)")
-            else:
-                self.lab_pulse.setText("Pulses: Paused")
+            self.lab_pulse.setText("Pulses: Paused" + (" (manual)" if self._pulse_manual_override is True else ""))
             self.lab_pulse.setStyleSheet("font-weight:bold; color: red")
 
-        # auto-resume only when in auto mode
-        if self._pulse_manual_override is None and isfinite(base_temp) and abs(base_temp-tgt)<=band:
-            self._pulse_paused=False
-            self.btn_pulse_toggle.setText("Pause Pulses")
-
-        # buffers
+        # --- Buffers & UI update ---
         self.t_buf.append(t); self.i_buf.append(i_meas); self.v_buf.append(v_meas); self.r_buf.append(r_meas); self.temp_buf.append(temp)
         if len(self.t_buf)>2000:
             self.t_buf=self.t_buf[-2000:]; self.i_buf=self.i_buf[-2000:]; self.v_buf=self.v_buf[-2000:]; self.r_buf=self.r_buf[-2000:]; self.temp_buf=self.temp_buf[-2000:]
