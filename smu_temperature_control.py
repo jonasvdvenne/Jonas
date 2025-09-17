@@ -8,7 +8,7 @@ import pyvisa
 from PyQt5.QtCore import QThread, QObject, pyqtSignal, QTimer, Qt
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QComboBox
+    QPushButton, QComboBox, QMessageBox
 )
 import pyqtgraph as pg
 
@@ -70,7 +70,7 @@ class PulseManager:
             self._pulse_active = False
 
         if self._pulse_active:
-            return np.sqrt(self.power_w / r0)
+            return np.sqrt(self.power_w / r0)  # constant-current pulse sized from R0
         else:
             return 0.0
 
@@ -172,8 +172,11 @@ class SMUGUI(QWidget):
 
         self._setpoint_value = self._warmup_current
 
-        # separate pulse manager
+        # pulse manager + control flags
         self.pulse_manager = PulseManager()
+        self._pulse_paused = True            # paused by default (matches initial label)
+        self._pulse_manual_override = None   # None=auto, True=force paused, False=force enabled
+        self._active_target_temp = 37.5      # confirmed target
 
         self._build_ui()
         self._wire_runtime()
@@ -262,12 +265,19 @@ class SMUGUI(QWidget):
         self.btn_update = QPushButton("Apply Settings")
         self.btn_r0 = QPushButton("Measure R₀")
         self.btn_toggle = QPushButton("Start Output"); self.btn_toggle.setCheckable(True)
+        self.btn_pulse_toggle = QPushButton("Resume Pulses")   # starts paused by default
         self.btn_reset = QPushButton("Reset Plots")
-        for b in (self.btn_update, self.btn_r0, self.btn_toggle, self.btn_reset): btns.addWidget(b)
+        for b in (self.btn_update, self.btn_r0, self.btn_toggle, self.btn_pulse_toggle, self.btn_reset):
+            btns.addWidget(b)
         layout.addLayout(btns)
 
         self.lab_r0 = QLabel("R₀: -- Ω"); self.lab_temp = QLabel("Filtered Temp: -- °C"); self.lab_iv = QLabel("I: -- | V: --")
         for lab in (self.lab_r0, self.lab_temp, self.lab_iv): lab.setStyleSheet("font-weight:bold"); layout.addWidget(lab)
+
+        # pulse status label
+        self.lab_pulse = QLabel("Pulses: Paused")
+        self.lab_pulse.setStyleSheet("font-weight:bold; color: red")
+        layout.addWidget(self.lab_pulse)
 
         self.plot_i = pg.PlotWidget(title="Current (A)"); self.plot_i.setBackground('w'); self.curve_i = self.plot_i.plot([],[],pen=pg.mkPen(color='k', width=2))
         layout.addWidget(self.plot_i)
@@ -281,12 +291,58 @@ class SMUGUI(QWidget):
         self.setLayout(layout)
         self.gui_timer=QTimer(self); self.gui_timer.setInterval(10); self.gui_timer.timeout.connect(self._on_gui_tick)
 
+        # confirm target temp change
+        self.target_temp.editingFinished.connect(self._confirm_target_change)
+
     def _wire_runtime(self):
         self.btn_update.clicked.connect(self._apply_smu_settings)
         self.btn_r0.clicked.connect(self._measure_r0)
         self.btn_toggle.clicked.connect(self._toggle_output)
+        self.btn_pulse_toggle.clicked.connect(self._toggle_pulses)  # manual override
         self.btn_reset.clicked.connect(self._reset_plots)
         self.current_setpoint.textEdited.connect(self._on_setpoint_edited)
+
+    # ---------------- Confirm target temp ----------------
+    def _confirm_target_change(self):
+        new_target = safe_float(self.target_temp, self._active_target_temp)
+        if self.worker and self.worker.running:
+            reply = QMessageBox.question(
+                self, "Confirm Target Change",
+                f"Change target temperature to {new_target:.2f} °C?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                # revert back
+                self.target_temp.setText(f"{self._active_target_temp:.2f}")
+                return
+        # confirmed: pause pulses automatically while re-acquiring setpoint (unless user forces override)
+        self._active_target_temp = new_target
+        if self._pulse_manual_override is None:
+            self._pulse_paused = True
+
+    # ---------------- Toggle pulses manually ----------------
+    def _toggle_pulses(self):
+        # Flip manual override: None->True (pause), True->False (enable), False->True (pause)
+        if self._pulse_manual_override is None:
+            self._pulse_manual_override = True
+        elif self._pulse_manual_override is True:
+            self._pulse_manual_override = False
+        else:
+            self._pulse_manual_override = True
+
+        # Apply the effective state immediately
+        if self._pulse_manual_override is True:
+            self._pulse_paused = True
+            self.btn_pulse_toggle.setText("Resume Pulses")
+            self.lab_pulse.setText("Pulses: Paused (manual)")
+            self.lab_pulse.setStyleSheet("font-weight:bold; color: red")
+            print("Pulses manually paused.")
+        else:
+            self._pulse_paused = False
+            self.btn_pulse_toggle.setText("Pause Pulses")
+            self.lab_pulse.setText("Pulses: Active (manual)")
+            self.lab_pulse.setStyleSheet("font-weight:bold; color: green")
+            print("Pulses manually resumed.")
 
     # ---------------- Settings ----------------
     def _apply_smu_settings(self):
@@ -383,25 +439,53 @@ class SMUGUI(QWidget):
         if len(self.temp_filter_buf)>self._temp_filter_window:self.temp_filter_buf.pop(0)
         valid=[x for x in self.temp_filter_buf if isfinite(x)]
         base_temp=float(np.mean(valid)) if valid else np.nan
-        tgt=safe_float(self.target_temp,37.5); band=abs(safe_float(self.temp_band,1.0))
+        tgt=self._active_target_temp
+        band=abs(safe_float(self.temp_band,1.0))
         self.line_target.setPos(tgt); self.line_upper.setPos(tgt+band); self.line_lower.setPos(tgt-band)
 
         if not isfinite(base_temp):
             self._set_setpoint(max(self._warmup_current,self.r0_current_used))
         else:
             err=tgt-base_temp; dt=max(1e-6,self.gui_timer.interval()/1000.0)
-            if abs(err)>10:Kp,Ki,Kd=0.0010,0.00010,0.00050
-            elif abs(err)>5:Kp,Ki,Kd=0.0006,0.00005,0.00030
-            else:Kp,Ki,Kd=0.0003,0.00002,0.00010
+            if abs(err)>10:Kp,Ki,Kd=0.0020,0.00010,0.001
+            elif abs(err)>5:Kp,Ki,Kd=0.0008,0.00005,0.0006
+            else:Kp,Ki,Kd=0.0003,0.0,0.00040
             self.pid_int=float(np.clip(self.pid_int+err*dt,-self._int_clip,self._int_clip))
             d=np.clip((err-self.pid_prev_err)/dt,-self._deriv_clip,self._deriv_clip)
             adj=Kp*err+Ki*self.pid_int+Kd*d
             i_new=max(self.r0_current_used,self._setpoint_value+adj)
             self._set_setpoint(i_new); self.pid_prev_err=err
 
-        # ask pulse manager
-        i_pulse=self.pulse_manager.get_pulse_current(self.r0_measured)
-        if i_pulse>0: self._set_setpoint(self._setpoint_value+i_pulse)
+        # Determine effective pause state (manual override wins)
+        if self._pulse_manual_override is True:
+            effective_paused = True
+        elif self._pulse_manual_override is False:
+            effective_paused = False
+        else:
+            effective_paused = self._pulse_paused
+
+        # pulse control + status label
+        if not effective_paused and self.pulse_manager.enabled:
+            i_pulse=self.pulse_manager.get_pulse_current(self.r0_measured)
+            if i_pulse>0:
+                self._set_setpoint(self._setpoint_value+i_pulse)
+            # show status (if manual override, mark it)
+            if self._pulse_manual_override is False:
+                self.lab_pulse.setText("Pulses: Active (manual)")
+            else:
+                self.lab_pulse.setText("Pulses: Active")
+            self.lab_pulse.setStyleSheet("font-weight:bold; color: green")
+        else:
+            if self._pulse_manual_override is True:
+                self.lab_pulse.setText("Pulses: Paused (manual)")
+            else:
+                self.lab_pulse.setText("Pulses: Paused")
+            self.lab_pulse.setStyleSheet("font-weight:bold; color: red")
+
+        # auto-resume only when in auto mode
+        if self._pulse_manual_override is None and isfinite(base_temp) and abs(base_temp-tgt)<=band:
+            self._pulse_paused=False
+            self.btn_pulse_toggle.setText("Pause Pulses")
 
         # buffers
         self.t_buf.append(t); self.i_buf.append(i_meas); self.v_buf.append(v_meas); self.r_buf.append(r_meas); self.temp_buf.append(temp)
