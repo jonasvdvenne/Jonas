@@ -1,5 +1,6 @@
 import sys
 import time
+import json
 from math import isfinite
 
 import numpy as np
@@ -8,7 +9,7 @@ import pyvisa
 from PyQt5.QtCore import QThread, QObject, pyqtSignal, QTimer, Qt
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QComboBox, QMessageBox
+    QPushButton, QComboBox, QMessageBox, QFileDialog
 )
 import pyqtgraph as pg
 
@@ -73,6 +74,7 @@ class PulseManager:
             return np.sqrt(self.power_w / r0)  # constant-current pulse sized from R0
         else:
             return 0.0
+
     def get_pulse_current_for_temp(self, r0: float, alpha: float, t0: float,
                                    temp_c: float, i_max: float = None, v_comp: float = None) -> float:
         """
@@ -128,7 +130,7 @@ class SMUWorker(QObject):
         self.max_current = float(max_current_clamp)
         self.min_current = float(min_current_floor)
         self.max_slew = float(max_slew_a_per_s)
-        self.loop_dt = 0.015  # ~50 Hz
+        self.loop_dt = 0.005  # ~50 Hz
 
     def _slew_limited(self, target_i, current_i, dt):
         max_delta = self.max_slew * dt
@@ -183,8 +185,8 @@ class SMUWorker(QObject):
 class SMUGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Keysight B2901 Temp Control (PID + Pulses)")
-        self.resize(1280, 900)
+        self.setWindowTitle("Keysight B2901 Temp Control (PID + Pulses + Slope)")
+        self.resize(1280, 1000)
 
         self.smu = self._init_smu()
         self.worker = None
@@ -192,6 +194,13 @@ class SMUGUI(QWidget):
 
         self.t_buf, self.i_buf, self.v_buf, self.r_buf = [], [], [], []
         self.temp_buf, self.temp_filter_buf = [], []
+        self.pulse_flag_buf = []  # per-sample pulse activity flag for exports
+        self.log_t, self.log_i, self.log_v, self.log_r = [], [], [], []
+        self.log_temp, self.log_pulse_flag = [], []
+        # Per-pulse slope results
+        self.pulse_events = []        # list of dicts per pulse (start/end/slope etc.)
+        self.slope_times = []         # x for slope plot (pulse start time)
+        self.slope_values = []        # y for slope plot (°C/s)
 
         self.r0_measured = None
         self.r0_current_used = 1e-4
@@ -219,6 +228,9 @@ class SMUGUI(QWidget):
         self._last_pulse_event_ts = 0.0   # last pulse start/end timestamp
         self._post_pulse_cooldown_s = 1.0 # lighten derivative for this long after pulse
         self._post_pulse_drop_limit = 0.02  # A per control update (soft clamp)
+
+        # Track pulse active state for slope windowing
+        self._prev_pulse_active = False
 
         self._build_ui()
         self._wire_runtime()
@@ -284,6 +296,10 @@ class SMUGUI(QWidget):
         self.pulse_duration = QLineEdit("0.0")
         self.pulse_period = QLineEdit("0.0")
 
+        # slope window params (relative to pulse start)
+        self.slope_t_start = QLineEdit("0.00")
+        self.slope_t_end = QLineEdit("0.50")
+
         layout.addLayout(self._row("Room Temp (°C)", self.room_temp))
         layout.addLayout(self._row("Alpha (1/°C)", self.alpha))
         layout.addLayout(self._row("Target Temp (°C)", self.target_temp))
@@ -299,6 +315,8 @@ class SMUGUI(QWidget):
         layout.addLayout(self._row("Pulse Power (W)", self.pulse_power))
         layout.addLayout(self._row("Pulse Duration (s)", self.pulse_duration))
         layout.addLayout(self._row("Pulse Period (s)", self.pulse_period))
+        layout.addLayout(self._row("Slope Window Start (s)", self.slope_t_start))
+        layout.addLayout(self._row("Slope Window End (s)", self.slope_t_end))
 
         self.current_setpoint = QLineEdit(f"{self._warmup_current:.6f}")
         layout.addLayout(self._row("Current Setpoint (A) [PID+Pulse]", self.current_setpoint))
@@ -309,7 +327,9 @@ class SMUGUI(QWidget):
         self.btn_toggle = QPushButton("Start Output"); self.btn_toggle.setCheckable(True)
         self.btn_pulse_toggle = QPushButton("Resume Pulses")
         self.btn_reset = QPushButton("Reset Plots")
-        for b in (self.btn_update, self.btn_r0, self.btn_toggle, self.btn_pulse_toggle, self.btn_reset):
+        self.btn_save_csv = QPushButton("Save CSV")
+        self.btn_save_json = QPushButton("Save JSON")
+        for b in (self.btn_update, self.btn_r0, self.btn_toggle, self.btn_pulse_toggle, self.btn_reset, self.btn_save_csv, self.btn_save_json):
             btns.addWidget(b)
         layout.addLayout(btns)
 
@@ -321,14 +341,24 @@ class SMUGUI(QWidget):
         self.lab_pulse.setStyleSheet("font-weight:bold; color: red")
         layout.addWidget(self.lab_pulse)
 
-        self.plot_i = pg.PlotWidget(title="Current (A)"); self.plot_i.setBackground('w'); self.curve_i = self.plot_i.plot([],[],pen=pg.mkPen(color='k', width=2),symbol='o', symbolSize=6, symbolBrush='k')
+        # Plots
+        self.plot_i = pg.PlotWidget(title="Current (A)"); self.plot_i.setBackground('w')
+        self.curve_i = self.plot_i.plot([],[],pen=pg.mkPen(color='k', width=2),symbol='o', symbolSize=6, symbolBrush='k')
         layout.addWidget(self.plot_i)
+
         self.plot_t = pg.PlotWidget(title="Temperature (°C)"); self.plot_t.setBackground('w')
         self.curve_t = self.plot_t.plot([],[],pen=pg.mkPen(color='b', width=2),symbol='o', symbolSize=6, symbolBrush='b')
         self.line_target=pg.InfiniteLine(angle=0,pen=pg.mkPen(color='k',style=Qt.DashLine))
-        self.line_upper=pg.InfiniteLine(angle=0,pen=pg.mkPen(color='r')); self.line_lower=pg.InfiniteLine(angle=0,pen=pg.mkPen(color='r'))
+        self.line_upper=pg.InfiniteLine(angle=0,pen=pg.mkPen(color='r'))
+        self.line_lower=pg.InfiniteLine(angle=0,pen=pg.mkPen(color='r'))
         for l in (self.line_target,self.line_upper,self.line_lower): self.plot_t.addItem(l)
         layout.addWidget(self.plot_t)
+
+        # NEW: Pulse slope plot
+        self.plot_slope = pg.PlotWidget(title="Pulse Slope (°C/s) — window relative to pulse start")
+        self.plot_slope.setBackground('w')
+        self.curve_slope = self.plot_slope.plot([], [], pen=None, symbol='o', symbolSize=8, symbolBrush='m')
+        layout.addWidget(self.plot_slope)
 
         self.setLayout(layout)
         self.gui_timer=QTimer(self); self.gui_timer.setInterval(10); self.gui_timer.timeout.connect(self._on_gui_tick)
@@ -342,6 +372,8 @@ class SMUGUI(QWidget):
         self.btn_toggle.clicked.connect(self._toggle_output)
         self.btn_pulse_toggle.clicked.connect(self._toggle_pulses)
         self.btn_reset.clicked.connect(self._reset_plots)
+        self.btn_save_csv.clicked.connect(self._save_csv)
+        self.btn_save_json.clicked.connect(self._save_json)
         self.current_setpoint.textEdited.connect(self._on_setpoint_edited)
 
     # ---------------- Confirm target temp ----------------
@@ -435,7 +467,10 @@ class SMUGUI(QWidget):
     def _toggle_output(self):
         if not self.smu: return
         if self.btn_toggle.isChecked():
-            if self.r0_measured is None: print("⚠ Measure R₀ first."); self.btn_toggle.setChecked(False); return
+            if self.r0_measured is None:
+                print("⚠ Measure R₀ first.")
+                self.btn_toggle.setChecked(False)
+                return
             self.pid_int=0.0; self.pid_prev_err=0.0
             self._set_setpoint(max(self._warmup_current,self.r0_current_used))
             max_i=safe_float(self.max_current,self._default_max_current)
@@ -475,6 +510,64 @@ class SMUGUI(QWidget):
 
     # ---------------- Tick ----------------
     def _on_gui_tick(self): pass
+
+    def _compute_pulse_slope_if_ready(self, now_t):
+        """
+        For the most recent pulse event that doesn't have a slope yet, check if we already
+        have enough samples in [start+dt0, start+dt1] and, if so, compute slope of Temp vs Time.
+        """
+        if not self.pulse_events:
+            return
+
+        dt0 = safe_float(self.slope_t_start, 0.0)
+        dt1 = safe_float(self.slope_t_end, 0.5)
+        if dt1 <= dt0:
+            return  # invalid window; ignore
+
+        # Find the latest event without a slope computed
+        for ev in reversed(self.pulse_events):
+            if ev.get("slope_computed", False):
+                continue
+            start = ev.get("start_time", None)
+            if start is None:
+                continue
+            # wait until end of window has passed
+            if now_t < (start + dt1):
+                continue
+            # Collect samples in window
+            t0 = start + dt0
+            t1 = start + dt1
+            # Use buffers (time and temperature)
+            t_arr = np.asarray(self.t_buf)
+            temp_arr = np.asarray(self.temp_buf)
+            if t_arr.size == 0 or temp_arr.size == 0:
+                continue
+            mask = (t_arr >= t0) & (t_arr <= t1) & np.isfinite(temp_arr)
+            if np.count_nonzero(mask) < 5:
+                # not enough samples to fit robustly
+                ev["slope_computed"] = True
+                ev["slope_c_per_s"] = np.nan
+                continue
+            tx = t_arr[mask]
+            ty = temp_arr[mask]
+            # Linear regression: Temp = m * t + b
+            try:
+                m, b = np.polyfit(tx, ty, 1)
+                slope = float(m)
+            except Exception:
+                slope = float('nan')
+
+            ev["slope_computed"] = True
+            ev["slope_c_per_s"] = slope
+            ev["slope_window"] = {"t_start": float(dt0), "t_end": float(dt1)}
+            # For plotting, place point at pulse start time
+            self.slope_times.append(float(start))
+            self.slope_values.append(slope)
+            # Update plot
+            self.curve_slope.setData(self.slope_times, self.slope_values)
+
+            # Only compute one per call
+            break
 
     def _on_worker_data(self, t, i_meas, v_meas, r_meas):
         # --- Temperature calculation & filtering ---
@@ -561,6 +654,7 @@ class SMUGUI(QWidget):
             effective_paused = self._pulse_paused
 
         i_pulse = 0.0
+        pulse_active_now = False
         if not effective_paused and self.pulse_manager.enabled:
             before = self.pulse_manager._pulse_active
             # Size pulses for the setpoint temperature (tgt)
@@ -573,12 +667,30 @@ class SMUGUI(QWidget):
                 v_comp=safe_float(self.volt_compliance, 2.0),
             )
             after = self.pulse_manager._pulse_active
+            pulse_active_now = after
 
-            # Detect pulse start/end to update cooldown timestamp
+            # Detect pulse start/end to update cooldown timestamp and slope bookkeeping
             if after and not before:
+                # pulse start
                 self._last_pulse_event_ts = t
+                self.pulse_events.append({
+                    "start_time": float(t),
+                    "end_time": None,
+                    "slope_computed": False,
+                    "slope_c_per_s": None,
+                    "window_params": {
+                        "t_start": safe_float(self.slope_t_start, 0.0),
+                        "t_end": safe_float(self.slope_t_end, 0.5)
+                    }
+                })
             if (not after) and before:
+                # pulse end
                 self._last_pulse_event_ts = t
+                # set end time on the latest open event
+                for ev in reversed(self.pulse_events):
+                    if ev.get("end_time") is None:
+                        ev["end_time"] = float(t)
+                        break
 
             self.lab_pulse.setText("Pulses: Active" + (" (manual)" if self._pulse_manual_override is False else ""))
             self.lab_pulse.setStyleSheet("font-weight:bold; color: green")
@@ -591,18 +703,196 @@ class SMUGUI(QWidget):
         self._latest_cmd = baseline + i_pulse
 
         # --- Buffers & UI update ---
-        self.t_buf.append(t); self.i_buf.append(i_meas); self.v_buf.append(v_meas); self.r_buf.append(r_meas); self.temp_buf.append(temp)
+# --- Append to log buffers (never trimmed) ---
+        self.log_t.append(t)
+        self.log_i.append(i_meas)
+        self.log_v.append(v_meas)
+        self.log_r.append(r_meas)
+        self.log_temp.append(temp)
+        self.log_pulse_flag.append(bool(pulse_active_now))
+        
+        # --- Append to plot buffers (trimmed at 2000 for GUI) ---
+        self.t_buf.append(t)
+        self.i_buf.append(i_meas)
+        self.v_buf.append(v_meas)
+        self.r_buf.append(r_meas)
+        self.temp_buf.append(temp)
+        self.pulse_flag_buf.append(bool(pulse_active_now))
+        
+        if len(self.t_buf) > 2000:
+            self.t_buf = self.t_buf[-2000:]
+            self.i_buf = self.i_buf[-2000:]
+            self.v_buf = self.v_buf[-2000:]
+            self.r_buf = self.r_buf[-2000:]
+            self.temp_buf = self.temp_buf[-2000:]
+            self.pulse_flag_buf = self.pulse_flag_buf[-2000:]
+
+
         if len(self.t_buf)>2000:
-            self.t_buf=self.t_buf[-2000:]; self.i_buf=self.i_buf[-2000:]; self.v_buf=self.v_buf[-2000:]; self.r_buf=self.r_buf[-2000:]; self.temp_buf=self.temp_buf[-2000:]
-        self.curve_i.setData(self.t_buf,self.i_buf); self.curve_t.setData(self.t_buf,self.temp_buf)
+            self.t_buf=self.t_buf[-2000:]
+            self.i_buf=self.i_buf[-2000:]
+            self.v_buf=self.v_buf[-2000:]
+            self.r_buf=self.r_buf[-2000:]
+            self.temp_buf=self.temp_buf[-2000:]
+            self.pulse_flag_buf=self.pulse_flag_buf[-2000:]
+
+        self.curve_i.setData(self.t_buf,self.i_buf)
+        self.curve_t.setData(self.t_buf,self.temp_buf)
         self.lab_iv.setText(f"I: {i_meas:.6f} A | V: {v_meas:.6f} V")
         if isfinite(base_temp): self.lab_temp.setText(f"Filtered Temp: {base_temp:.2f} °C")
         else: self.lab_temp.setText("Filtered Temp: -- °C")
 
+        # If a pulse window has completed, compute slope and update plot
+        self._compute_pulse_slope_if_ready(t)
+
+    # ---------------- Exports ----------------
+    def _save_csv(self):
+        """
+        Save per-sample timeseries to CSV.
+        Now includes metadata/settings in commented header rows.
+        """
+        if not self.t_buf:
+            QMessageBox.information(self, "Save CSV", "No data to save yet.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save CSV", filter="CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            import csv
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+
+                # ---------- Metadata header (commented with '#') ----------
+                meta = {
+                    "r0_ohm": float(self.r0_measured) if self.r0_measured is not None else None,
+                    "room_temp_c": safe_float(self.room_temp, 22.0),
+                    "alpha_per_c": safe_float(self.alpha, 0.00381),
+                    "target_temp_c": float(self._active_target_temp),
+                    "max_current_a": safe_float(self.max_current, self._default_max_current),
+                    "compliance_v": safe_float(self.volt_compliance, 2.0),
+                    "pulse_settings": {
+                        "enabled": bool(self.pulse_manager.enabled),
+                        "power_w": float(self.pulse_manager.power_w),
+                        "duration_s": float(self.pulse_manager.duration_s),
+                        "period_s": float(self.pulse_manager.period_s)
+                    },
+                    "slope_window": {
+                        "t_start_s": safe_float(self.slope_t_start, 0.0),
+                        "t_end_s": safe_float(self.slope_t_end, 0.5)
+                    }
+                }
+                # Write each metadata entry as a header line
+                f.write("# METADATA SETTINGS\n")
+                for k, v in meta.items():
+                    f.write(f"# {k}: {v}\n")
+                f.write("# ----------------\n")
+
+                # ---------- Column header ----------
+                w.writerow([
+                    "time_s", "current_a", "voltage_v", "resistance_ohm", "temperature_c",
+                    "pulse_active"
+                ])
+
+                # ---------- Timeseries ----------
+                for t,i,v,r,temp,flag in zip(
+                    self.log_t, self.log_i, self.log_v, self.log_r,
+                    self.log_temp, self.log_pulse_flag
+                ):
+
+                    w.writerow([
+                        f"{float(t):.6f}",
+                        f"{float(i):.9f}",
+                        f"{float(v):.9f}",
+                        f"{float(r) if isfinite(r) else np.nan:.9f}",
+                        f"{float(temp) if isfinite(temp) else np.nan:.6f}",
+                        int(bool(flag))
+                    ])
+            QMessageBox.information(self, "Save CSV", f"Saved CSV:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save CSV", f"Failed to save CSV:\n{e}")
+
+
+    def _save_json(self):
+        """
+        Save full dataset to JSON, INCLUDING slope data and pulse event metadata.
+        Also includes per-sample pulse_active flags (note of when pulses were happening).
+        """
+        if not self.t_buf:
+            QMessageBox.information(self, "Save JSON", "No data to save yet.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save JSON", filter="JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            payload = {
+                "r0_ohm": float(self.r0_measured) if self.r0_measured is not None else None,
+                "room_temp_c": safe_float(self.room_temp, 22.0),
+                "alpha_per_c": safe_float(self.alpha, 0.00381),
+                "target_temp_c": float(self._active_target_temp),
+                "max_current_a": safe_float(self.max_current, self._default_max_current),
+                "compliance_v": safe_float(self.volt_compliance, 2.0),
+                "pulse_settings": {
+                    "enabled": bool(self.pulse_manager.enabled),
+                    "power_w": float(self.pulse_manager.power_w),
+                    "duration_s": float(self.pulse_manager.duration_s),
+                    "period_s": float(self.pulse_manager.period_s)
+                },
+                "slope_window": {
+                    "t_start_s": safe_float(self.slope_t_start, 0.0),
+                    "t_end_s": safe_float(self.slope_t_end, 0.5)
+                },
+                "samples": [
+                    {
+                        "t_s": float(t),
+                        "i_a": float(i),
+                        "v_v": float(v),
+                        "r_ohm": float(r) if isfinite(r) else None,
+                        "temp_c": float(temp) if isfinite(temp) else None,
+                        "pulse_active": bool(flag)
+                    }
+                    for t,i,v,r,temp,flag in zip(
+        self.log_t, self.log_i, self.log_v, self.log_r,
+        self.log_temp, self.log_pulse_flag
+    )
+                ],
+                "pulse_events": self._serialize_pulse_events()
+            }
+            with open(path, "w") as f:
+                json.dump(payload, f, indent=2)
+            QMessageBox.information(self, "Save JSON", f"Saved JSON:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save JSON", f"Failed to save JSON:\n{e}")
+
+    def _serialize_pulse_events(self):
+        # Ensure we export numeric types + include any slopes already computed
+        out = []
+        for ev in self.pulse_events:
+            out.append({
+                "start_time_s": float(ev.get("start_time")) if ev.get("start_time") is not None else None,
+                "end_time_s": float(ev.get("end_time")) if ev.get("end_time") is not None else None,
+                "slope_c_per_s": (float(ev.get("slope_c_per_s"))
+                                  if (ev.get("slope_c_per_s") is not None and isfinite(ev.get("slope_c_per_s")))
+                                  else None),
+                "slope_computed": bool(ev.get("slope_computed", False)),
+                "slope_window_s": ev.get("slope_window") or ev.get("window_params") or {
+                    "t_start": safe_float(self.slope_t_start, 0.0),
+                    "t_end": safe_float(self.slope_t_end, 0.5)
+                }
+            })
+        return out
+
     # ---------------- Misc ----------------
     def _reset_plots(self):
-        self.t_buf.clear(); self.i_buf.clear(); self.v_buf.clear(); self.r_buf.clear(); self.temp_buf.clear(); self.temp_filter_buf.clear()
+        self.t_buf.clear(); self.i_buf.clear(); self.v_buf.clear(); self.r_buf.clear()
+        self.temp_buf.clear(); self.temp_filter_buf.clear(); self.pulse_flag_buf.clear()
         self.curve_i.setData([],[]); self.curve_t.setData([],[])
+
+        self.pulse_events.clear()
+        self.slope_times.clear(); self.slope_values.clear()
+        self.curve_slope.setData([], [])
+        self.log_t.clear(); self.log_i.clear(); self.log_v.clear(); self.log_r.clear()
+        self.log_temp.clear(); self.log_pulse_flag.clear()
+
     def closeEvent(self,event):
         try:
             if self.worker:self.worker.stop()
@@ -614,7 +904,7 @@ class SMUGUI(QWidget):
 
 # =========================
 # Run
-# =========================
+# =========================A
 
 if __name__=="__main__":
     app=QApplication(sys.argv); gui=SMUGUI(); gui.show(); sys.exit(app.exec_())
