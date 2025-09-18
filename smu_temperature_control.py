@@ -130,7 +130,7 @@ class SMUWorker(QObject):
         self.max_current = float(max_current_clamp)
         self.min_current = float(min_current_floor)
         self.max_slew = float(max_slew_a_per_s)
-        self.loop_dt = 0.005  # ~50 Hz
+        self.loop_dt = 0.001  # ~50 Hz
 
     def _slew_limited(self, target_i, current_i, dt):
         max_delta = self.max_slew * dt
@@ -255,9 +255,9 @@ class SMUGUI(QWidget):
                     inst.write("SENS:VOLT:PROT 2")
                     inst.write("SENS:VOLT:RANG 2")
                     inst.write("SENS:REM ON")
-                    inst.write(":SENS:VOLT:APER 0.01")
+                    inst.write(":SENS:VOLT:APER 0.001")
                     inst.write("SENS:CURR:RANG 0.4")
-                    inst.write(":SENS:CURR:APER 0.01")
+                    inst.write(":SENS:CURR:APER 0.001")
                     return inst
             except Exception as e:
                 print(f"Could not connect to {addr}: {e}")
@@ -425,7 +425,7 @@ class SMUGUI(QWidget):
             self.smu.write(f":SENS:CURR:RANG {float(self.meas_i_range.currentText())}")
             self.smu.write(f":SENS:VOLT:RANG {float(self.meas_v_range.currentText())}")
             self.smu.write(f":SENS:VOLT:PROT {vprot}")
-            self.smu.write(":SENS:VOLT:APER 0.01"); self.smu.write(":SENS:CURR:APER 0.01")
+            self.smu.write(":SENS:VOLT:APER 0.001"); self.smu.write(":SENS:CURR:APER 0.001")
             self.smu.write(":SENS:CURR:PROT 1"); self.smu.write("SENS:REM ON")
             print("SMU settings applied.")
 
@@ -711,7 +711,7 @@ class SMUGUI(QWidget):
         self.log_temp.append(temp)
         self.log_pulse_flag.append(bool(pulse_active_now))
         
-        # --- Append to plot buffers (trimmed at 2000 for GUI) ---
+        # --- Append to plot buffers (trimmed at 1000 for GUI) ---
         self.t_buf.append(t)
         self.i_buf.append(i_meas)
         self.v_buf.append(v_meas)
@@ -719,22 +719,22 @@ class SMUGUI(QWidget):
         self.temp_buf.append(temp)
         self.pulse_flag_buf.append(bool(pulse_active_now))
         
-        if len(self.t_buf) > 2000:
-            self.t_buf = self.t_buf[-2000:]
-            self.i_buf = self.i_buf[-2000:]
-            self.v_buf = self.v_buf[-2000:]
-            self.r_buf = self.r_buf[-2000:]
-            self.temp_buf = self.temp_buf[-2000:]
-            self.pulse_flag_buf = self.pulse_flag_buf[-2000:]
+        if len(self.t_buf) > 1000:
+            self.t_buf = self.t_buf[-1000:]
+            self.i_buf = self.i_buf[-1000:]
+            self.v_buf = self.v_buf[-1000:]
+            self.r_buf = self.r_buf[-1000:]
+            self.temp_buf = self.temp_buf[-1000:]
+            self.pulse_flag_buf = self.pulse_flag_buf[-1000:]
 
 
-        if len(self.t_buf)>2000:
-            self.t_buf=self.t_buf[-2000:]
-            self.i_buf=self.i_buf[-2000:]
-            self.v_buf=self.v_buf[-2000:]
-            self.r_buf=self.r_buf[-2000:]
-            self.temp_buf=self.temp_buf[-2000:]
-            self.pulse_flag_buf=self.pulse_flag_buf[-2000:]
+        if len(self.t_buf)>1000:
+            self.t_buf=self.t_buf[-1000:]
+            self.i_buf=self.i_buf[-1000:]
+            self.v_buf=self.v_buf[-1000:]
+            self.r_buf=self.r_buf[-1000:]
+            self.temp_buf=self.temp_buf[-1000:]
+            self.pulse_flag_buf=self.pulse_flag_buf[-1000:]
 
         self.curve_i.setData(self.t_buf,self.i_buf)
         self.curve_t.setData(self.t_buf,self.temp_buf)
