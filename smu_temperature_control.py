@@ -73,6 +73,40 @@ class PulseManager:
             return np.sqrt(self.power_w / r0)  # constant-current pulse sized from R0
         else:
             return 0.0
+    def get_pulse_current_for_temp(self, r0: float, alpha: float, t0: float,
+                                   temp_c: float, i_max: float = None, v_comp: float = None) -> float:
+        """
+        Compute pulse current that delivers ~constant power at a chosen temperature.
+        Uses predicted resistance R(T). Also advances the pulse timing state.
+        Obeys optional current and voltage clamps.
+        """
+        if not self.enabled or not isfinite(r0) or r0 <= 0 or not isfinite(alpha) or not isfinite(temp_c):
+            return 0.0
+
+        # --- TICK THE PULSE STATE MACHINE (start/stop based on time) ---
+        _ = self.get_pulse_current(r0)   # updates _pulse_active, _last_pulse_time, _pulse_end_time
+
+        # If we're not currently in a pulse window, no extra current
+        if not self._pulse_active:
+            return 0.0
+
+        # Predict resistance at chosen temperature
+        r_target = r0 * (1.0 + alpha * (temp_c - t0))
+        if not isfinite(r_target) or r_target <= 0:
+            return 0.0
+
+        # Base current for desired power
+        i = np.sqrt(max(self.power_w, 0.0) / r_target)
+
+        # Respect compliance voltage (if provided)
+        if isfinite(v_comp) and v_comp > 0:
+            i = min(i, v_comp / r_target)
+
+        # Respect current limit (if provided)
+        if isfinite(i_max) and i_max > 0:
+            i = min(i, i_max)
+
+        return float(i)
 
 
 # =========================
@@ -83,11 +117,11 @@ class SMUWorker(QObject):
     data_ready = pyqtSignal(float, float, float, float)
     finished = pyqtSignal()
 
-    def __init__(self, smu, get_target_current_func,
+    def __init__(self, smu, get_target_cmd_func,
                  max_current_clamp=0.52, min_current_floor=1e-4, max_slew_a_per_s=10.0):
         super().__init__()
         self.smu = smu
-        self.get_target_current = get_target_current_func
+        self.get_target_cmd = get_target_cmd_func  # renamed for clarity
         self.running = False
         self.start_time = None
         self.latest_i_cmd = min_current_floor
@@ -112,7 +146,7 @@ class SMUWorker(QObject):
         while self.running:
             t = time.time() - self.start_time
             try:
-                i_target = float(self.get_target_current())
+                i_target = float(self.get_target_cmd())
                 if not isfinite(i_target):
                     i_target = self.min_current
                 i_target = np.clip(i_target, self.min_current, self.max_current)
@@ -171,6 +205,7 @@ class SMUGUI(QWidget):
         self._int_clip = 1000.0
 
         self._setpoint_value = self._warmup_current
+        self._latest_cmd = self._setpoint_value  # combined baseline + pulse (NEW)
 
         # pulse manager + control flags
         self.pulse_manager = PulseManager()
@@ -286,10 +321,10 @@ class SMUGUI(QWidget):
         self.lab_pulse.setStyleSheet("font-weight:bold; color: red")
         layout.addWidget(self.lab_pulse)
 
-        self.plot_i = pg.PlotWidget(title="Current (A)"); self.plot_i.setBackground('w'); self.curve_i = self.plot_i.plot([],[],pen=pg.mkPen(color='k', width=2))
+        self.plot_i = pg.PlotWidget(title="Current (A)"); self.plot_i.setBackground('w'); self.curve_i = self.plot_i.plot([],[],pen=pg.mkPen(color='k', width=2),symbol='o', symbolSize=6, symbolBrush='k')
         layout.addWidget(self.plot_i)
         self.plot_t = pg.PlotWidget(title="Temperature (°C)"); self.plot_t.setBackground('w')
-        self.curve_t = self.plot_t.plot([],[],pen=pg.mkPen(color='b', width=2))
+        self.curve_t = self.plot_t.plot([],[],pen=pg.mkPen(color='b', width=2),symbol='o', symbolSize=6, symbolBrush='b')
         self.line_target=pg.InfiniteLine(angle=0,pen=pg.mkPen(color='k',style=Qt.DashLine))
         self.line_upper=pg.InfiniteLine(angle=0,pen=pg.mkPen(color='r')); self.line_lower=pg.InfiniteLine(angle=0,pen=pg.mkPen(color='r'))
         for l in (self.line_target,self.line_upper,self.line_lower): self.plot_t.addItem(l)
@@ -405,7 +440,8 @@ class SMUGUI(QWidget):
             self._set_setpoint(max(self._warmup_current,self.r0_current_used))
             max_i=safe_float(self.max_current,self._default_max_current)
             self.smu.write("OUTP ON")
-            self.worker=SMUWorker(self.smu,lambda:self._setpoint_value,max_i,self.r0_current_used,10.0)
+            # Worker now reads the combined command (baseline + pulse)
+            self.worker=SMUWorker(self.smu,lambda:getattr(self,"_latest_cmd",self._setpoint_value),max_i,self.r0_current_used,10.0)
             self.thread=QThread(); self.worker.moveToThread(self.thread)
             self.thread.started.connect(self.worker.start)
             self.worker.data_ready.connect(self._on_worker_data)
@@ -427,11 +463,15 @@ class SMUGUI(QWidget):
         value=float(np.clip(value,self.r0_current_used,max_i))
         self._setpoint_value=value
         self.current_setpoint.blockSignals(True); self.current_setpoint.setText(f"{value:.6f}"); self.current_setpoint.blockSignals(False)
+        # keep latest command in sync when no pulse (baseline)
+        self._latest_cmd = value
+
     def _on_setpoint_edited(self,text:str):
         try: val=float(text)
         except: return
         max_i=safe_float(self.max_current,self._default_max_current)
         self._setpoint_value=float(np.clip(val,self.r0_current_used,max_i))
+        self._latest_cmd = self._setpoint_value
 
     # ---------------- Tick ----------------
     def _on_gui_tick(self): pass
@@ -520,9 +560,18 @@ class SMUGUI(QWidget):
         else:
             effective_paused = self._pulse_paused
 
+        i_pulse = 0.0
         if not effective_paused and self.pulse_manager.enabled:
             before = self.pulse_manager._pulse_active
-            i_pulse = self.pulse_manager.get_pulse_current(self.r0_measured)
+            # Size pulses for the setpoint temperature (tgt)
+            i_pulse = self.pulse_manager.get_pulse_current_for_temp(
+                r0=self.r0_measured,
+                alpha=safe_float(self.alpha, 0.00381),
+                t0=safe_float(self.room_temp, 22.0),
+                temp_c=tgt,  # <-- use setpoint temp, not measured
+                i_max=safe_float(self.max_current, self._default_max_current),
+                v_comp=safe_float(self.volt_compliance, 2.0),
+            )
             after = self.pulse_manager._pulse_active
 
             # Detect pulse start/end to update cooldown timestamp
@@ -531,14 +580,15 @@ class SMUGUI(QWidget):
             if (not after) and before:
                 self._last_pulse_event_ts = t
 
-            if i_pulse > 0:
-                self._set_setpoint(self._setpoint_value + i_pulse)
-
             self.lab_pulse.setText("Pulses: Active" + (" (manual)" if self._pulse_manual_override is False else ""))
             self.lab_pulse.setStyleSheet("font-weight:bold; color: green")
         else:
             self.lab_pulse.setText("Pulses: Paused" + (" (manual)" if self._pulse_manual_override is True else ""))
             self.lab_pulse.setStyleSheet("font-weight:bold; color: red")
+
+        # baseline = PID output; final commanded current = baseline + pulse
+        baseline = self._setpoint_value
+        self._latest_cmd = baseline + i_pulse
 
         # --- Buffers & UI update ---
         self.t_buf.append(t); self.i_buf.append(i_meas); self.v_buf.append(v_meas); self.r_buf.append(r_meas); self.temp_buf.append(temp)
