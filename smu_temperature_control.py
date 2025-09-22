@@ -1,6 +1,8 @@
 import sys
 import time
 import json
+import os
+import tempfile
 from math import isfinite
 
 import numpy as np
@@ -29,6 +31,23 @@ def calculate_temperature(r, r0, alpha=0.00381, t0=22.0):
     if r0 is None or r0 <= 0 or not isfinite(r0) or not isfinite(r) or r <= 0:
         return np.nan
     return (r / r0 - 1.0) / alpha + t0
+
+
+def _atomic_write(path: str, data: bytes):
+    """Crash-safe atomic write: write to temp, fsync, then replace."""
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=os.path.splitext(path)[1])
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
 
 
 # =========================
@@ -130,7 +149,7 @@ class SMUWorker(QObject):
         self.max_current = float(max_current_clamp)
         self.min_current = float(min_current_floor)
         self.max_slew = float(max_slew_a_per_s)
-        self.loop_dt = 0.001  # ~50 Hz
+        self.loop_dt = 0.004 
 
     def _slew_limited(self, target_i, current_i, dt):
         max_delta = self.max_slew * dt
@@ -158,10 +177,16 @@ class SMUWorker(QObject):
 
                 self.smu.write(f"SOUR:CURR {i_cmd:.6f}")
 
-                self.smu.write("MEAS:CURR?")
-                i_meas = float(self.smu.read())
-                self.smu.write("MEAS:VOLT?")
-                v_meas = float(self.smu.read())
+                resp = self.smu.query("MEAS:CURR?;:MEAS:VOLT?")
+                parts = resp.replace(";", " ").replace(",", " ").split()
+                if len(parts) >= 2:
+                    i_meas = float(parts[0])
+                    v_meas = float(parts[1])
+                else:
+                    # fallback if instrument firmware splits responses
+                    self.smu.write("MEAS:CURR?"); i_meas = float(self.smu.read())
+                    self.smu.write("MEAS:VOLT?"); v_meas = float(self.smu.read())
+
                 r_meas = (v_meas / i_meas) if i_meas != 0 else np.nan
 
                 self.data_ready.emit(t, i_meas, v_meas, r_meas)
@@ -232,6 +257,9 @@ class SMUGUI(QWidget):
         # Track pulse active state for slope windowing
         self._prev_pulse_active = False
 
+        # Frozen at run start
+        self._run_metadata = None
+
         self._build_ui()
         self._wire_runtime()
 
@@ -258,11 +286,54 @@ class SMUGUI(QWidget):
                     inst.write(":SENS:VOLT:APER 0.001")
                     inst.write("SENS:CURR:RANG 0.4")
                     inst.write(":SENS:CURR:APER 0.001")
+                    inst.write(":SENS:FUNC:CONC ON")      # measure current & voltage together
+                    inst.write(":SENS:VOLT:NPLC 0.01")    # shorter integration time
+                    inst.write(":SENS:CURR:NPLC 0.01")
+                    inst.write(":SYST:AZER OFF")          # disable autozero
+                    inst.write(":SENS:AVER:STAT OFF")     # disable averaging
+                    inst.write(":DISP:ENAB OFF")          # (optional) disable display for speed
                     return inst
             except Exception as e:
                 print(f"Could not connect to {addr}: {e}")
         print("No Keysight B2901 found.")
         return None
+
+    # ---------------- Frozen metadata helpers ----------------
+    def _start_run_metadata(self):
+        """Capture metadata once at run start (no drift)."""
+        return {
+            "schema_version": "1.0.0",
+            "created_utc": time.time(),
+            "instrument_idn": self.smu.query("*IDN?").strip() if self.smu else None,
+            "r0_ohm": float(self.r0_measured) if self.r0_measured is not None else None,
+            "room_temp_c": safe_float(self.room_temp, 22.0),
+            "alpha_per_c": safe_float(self.alpha, 0.00381),
+            "target_temp_c": float(self._active_target_temp),
+            "max_current_a": safe_float(self.max_current, self._default_max_current),
+            "compliance_v": safe_float(self.volt_compliance, 2.0),
+            "pulse_settings": {
+                "enabled": bool(self.pulse_manager.enabled),
+                "power_w": float(self.pulse_manager.power_w),
+                "duration_s": float(self.pulse_manager.duration_s),
+                "period_s": float(self.pulse_manager.period_s)
+            },
+            "slope_window_s": {
+                "t_start": safe_float(self.slope_t_start, 0.0),
+                "t_end": safe_float(self.slope_t_end, 0.5)
+            }
+        }
+
+    def _snapshot_series(self):
+        """Return shallow copies of logs to avoid races during save."""
+        return (
+            list(self.log_t),
+            list(self.log_i),
+            list(self.log_v),
+            list(self.log_r),
+            list(self.log_temp),
+            list(self.log_pulse_flag),
+            list(self.pulse_events),
+        )
 
     # ---------------- UI ----------------
     def _row(self, label, widget):
@@ -476,6 +547,10 @@ class SMUGUI(QWidget):
             max_i=safe_float(self.max_current,self._default_max_current)
             self.smu.write("OUTP ON")
             # Worker now reads the combined command (baseline + pulse)
+
+            # Freeze run metadata right at start
+            self._run_metadata = self._start_run_metadata()
+
             self.worker=SMUWorker(self.smu,lambda:getattr(self,"_latest_cmd",self._setpoint_value),max_i,self.r0_current_used,10.0)
             self.thread=QThread(); self.worker.moveToThread(self.thread)
             self.thread.started.connect(self.worker.start)
@@ -510,6 +585,18 @@ class SMUGUI(QWidget):
 
     # ---------------- Tick ----------------
     def _on_gui_tick(self): pass
+
+    def _append_log_safe(self, buf, val):
+        """Append only finite floats; store NaN if invalid."""
+        try:
+            f = float(val)
+            if isfinite(f):
+                buf.append(f)
+            else:
+                buf.append(np.nan)
+        except Exception:
+            buf.append(np.nan)
+
 
     def _compute_pulse_slope_if_ready(self, now_t):
         """
@@ -600,12 +687,12 @@ class SMUGUI(QWidget):
             elif abs(err) > 5:
                 Kp, Ki, Kd = 0.00080, 0.00002, 0.00090
             else:
-                Kp, Ki, Kd = 0.00035, 0.000001, 0.00045
+                Kp, Ki, Kd = 0.00025, 0.000001, 0.00035
 
             # Post-pulse: soften derivative to avoid undershoot
-            kd_scale = 1.0
+            kd_scale = 1.5
             if (t - self._last_pulse_event_ts) <= self._post_pulse_cooldown_s:
-                kd_scale = 0.05  # 20% derivative while cooling down
+                kd_scale = 0.01  # 20% derivative while cooling down
 
             # integral with anti-windup
             max_i = safe_float(self.max_current, self._default_max_current)
@@ -703,14 +790,15 @@ class SMUGUI(QWidget):
         self._latest_cmd = baseline + i_pulse
 
         # --- Buffers & UI update ---
-# --- Append to log buffers (never trimmed) ---
-        self.log_t.append(t)
-        self.log_i.append(i_meas)
-        self.log_v.append(v_meas)
-        self.log_r.append(r_meas)
-        self.log_temp.append(temp)
+        # --- Append to log buffers (never trimmed, sanitized) ---
+        self._append_log_safe(self.log_t, t)
+        self._append_log_safe(self.log_i, i_meas)
+        self._append_log_safe(self.log_v, v_meas)
+        self._append_log_safe(self.log_r, r_meas)
+        self._append_log_safe(self.log_temp, temp)
         self.log_pulse_flag.append(bool(pulse_active_now))
-        
+
+
         # --- Append to plot buffers (trimmed at 1000 for GUI) ---
         self.t_buf.append(t)
         self.i_buf.append(i_meas)
@@ -718,7 +806,7 @@ class SMUGUI(QWidget):
         self.r_buf.append(r_meas)
         self.temp_buf.append(temp)
         self.pulse_flag_buf.append(bool(pulse_active_now))
-        
+
         if len(self.t_buf) > 1000:
             self.t_buf = self.t_buf[-1000:]
             self.i_buf = self.i_buf[-1000:]
@@ -726,15 +814,6 @@ class SMUGUI(QWidget):
             self.r_buf = self.r_buf[-1000:]
             self.temp_buf = self.temp_buf[-1000:]
             self.pulse_flag_buf = self.pulse_flag_buf[-1000:]
-
-
-        if len(self.t_buf)>1000:
-            self.t_buf=self.t_buf[-1000:]
-            self.i_buf=self.i_buf[-1000:]
-            self.v_buf=self.v_buf[-1000:]
-            self.r_buf=self.r_buf[-1000:]
-            self.temp_buf=self.temp_buf[-1000:]
-            self.pulse_flag_buf=self.pulse_flag_buf[-1000:]
 
         self.curve_i.setData(self.t_buf,self.i_buf)
         self.curve_t.setData(self.t_buf,self.temp_buf)
@@ -749,124 +828,104 @@ class SMUGUI(QWidget):
     def _save_csv(self):
         """
         Save per-sample timeseries to CSV.
-        Now includes metadata/settings in commented header rows.
+        Uses frozen run metadata; atomic write for safety.
+        Floats are formatted; if conversion fails, raw value is kept.
+        Ensures all rows are written even if logs are uneven.
         """
-        if not self.t_buf:
+        if not self.log_t:
             QMessageBox.information(self, "Save CSV", "No data to save yet.")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Save CSV", filter="CSV Files (*.csv)")
         if not path:
             return
         try:
-            import csv
-            with open(path, "w", newline="") as f:
-                w = csv.writer(f)
-
-                # ---------- Metadata header (commented with '#') ----------
-                meta = {
-                    "r0_ohm": float(self.r0_measured) if self.r0_measured is not None else None,
-                    "room_temp_c": safe_float(self.room_temp, 22.0),
-                    "alpha_per_c": safe_float(self.alpha, 0.00381),
-                    "target_temp_c": float(self._active_target_temp),
-                    "max_current_a": safe_float(self.max_current, self._default_max_current),
-                    "compliance_v": safe_float(self.volt_compliance, 2.0),
-                    "pulse_settings": {
-                        "enabled": bool(self.pulse_manager.enabled),
-                        "power_w": float(self.pulse_manager.power_w),
-                        "duration_s": float(self.pulse_manager.duration_s),
-                        "period_s": float(self.pulse_manager.period_s)
-                    },
-                    "slope_window": {
-                        "t_start_s": safe_float(self.slope_t_start, 0.0),
-                        "t_end_s": safe_float(self.slope_t_end, 0.5)
-                    }
-                }
-                # Write each metadata entry as a header line
-                f.write("# METADATA SETTINGS\n")
-                for k, v in meta.items():
-                    f.write(f"# {k}: {v}\n")
-                f.write("# ----------------\n")
-
-                # ---------- Column header ----------
+            import csv, io, itertools
+    
+            # --- Safe formatter: float if possible, else raw string ---
+            def fmt_val(val, fmt):
+                try:
+                    if val is None or val == "":
+                        return ""
+                    f = float(val)
+                    if not isfinite(f):
+                        return ""
+                    return format(f, fmt)
+                except Exception:
+                    return str(val)
+    
+            t, i, v, r, temp, flag, events = self._snapshot_series()
+    
+            # Use frozen metadata captured at run start; fallback to current if missing
+            meta = self._run_metadata if self._run_metadata is not None else self._start_run_metadata()
+    
+            buf = io.StringIO()
+            buf.write("# METADATA SETTINGS\n")
+            for k, v in meta.items():
+                buf.write(f"# {k}: {v}\n")
+            buf.write("# ----------------\n")
+    
+            w = csv.writer(buf, lineterminator="\n")
+            w.writerow(["time_s", "current_a", "voltage_v", "resistance_ohm", "temperature_c", "pulse_active"])
+    
+            # Use zip_longest so no rows are dropped
+            for ts_, ia, vv, rr, tc, pf in itertools.zip_longest(t, i, v, r, temp, flag, fillvalue=""):
                 w.writerow([
-                    "time_s", "current_a", "voltage_v", "resistance_ohm", "temperature_c",
-                    "pulse_active"
+                    fmt_val(ts_, ".6f"),
+                    fmt_val(ia, ".9f"),
+                    fmt_val(vv, ".9f"),
+                    fmt_val(rr, ".9f"),
+                    fmt_val(tc, ".6f"),
+                    int(bool(pf)) if pf not in ("", None, "") else 0
                 ])
-
-                # ---------- Timeseries ----------
-                for t,i,v,r,temp,flag in zip(
-                    self.log_t, self.log_i, self.log_v, self.log_r,
-                    self.log_temp, self.log_pulse_flag
-                ):
-
-                    w.writerow([
-                        f"{float(t):.6f}",
-                        f"{float(i):.9f}",
-                        f"{float(v):.9f}",
-                        f"{float(r) if isfinite(r) else np.nan:.9f}",
-                        f"{float(temp) if isfinite(temp) else np.nan:.6f}",
-                        int(bool(flag))
-                    ])
+    
+            _atomic_write(path, buf.getvalue().encode("utf-8"))
             QMessageBox.information(self, "Save CSV", f"Saved CSV:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Save CSV", f"Failed to save CSV:\n{e}")
 
 
+
     def _save_json(self):
         """
         Save full dataset to JSON, INCLUDING slope data and pulse event metadata.
-        Also includes per-sample pulse_active flags (note of when pulses were happening).
+        Uses frozen run metadata; atomic write for safety.
         """
-        if not self.t_buf:
+        if not self.log_t:
             QMessageBox.information(self, "Save JSON", "No data to save yet.")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Save JSON", filter="JSON Files (*.json)")
         if not path:
             return
         try:
+            t,i,v,r,temp,flag,events = self._snapshot_series()
+
             payload = {
-                "r0_ohm": float(self.r0_measured) if self.r0_measured is not None else None,
-                "room_temp_c": safe_float(self.room_temp, 22.0),
-                "alpha_per_c": safe_float(self.alpha, 0.00381),
-                "target_temp_c": float(self._active_target_temp),
-                "max_current_a": safe_float(self.max_current, self._default_max_current),
-                "compliance_v": safe_float(self.volt_compliance, 2.0),
-                "pulse_settings": {
-                    "enabled": bool(self.pulse_manager.enabled),
-                    "power_w": float(self.pulse_manager.power_w),
-                    "duration_s": float(self.pulse_manager.duration_s),
-                    "period_s": float(self.pulse_manager.period_s)
-                },
-                "slope_window": {
-                    "t_start_s": safe_float(self.slope_t_start, 0.0),
-                    "t_end_s": safe_float(self.slope_t_end, 0.5)
-                },
+                "metadata": self._run_metadata if self._run_metadata is not None else self._start_run_metadata(),
                 "samples": [
                     {
-                        "t_s": float(t),
-                        "i_a": float(i),
-                        "v_v": float(v),
-                        "r_ohm": float(r) if isfinite(r) else None,
-                        "temp_c": float(temp) if isfinite(temp) else None,
-                        "pulse_active": bool(flag)
+                        "t_s": float(ts_),
+                        "i_a": float(ia),
+                        "v_v": float(vv),
+                        "r_ohm": float(rr) if (rr is not None and isfinite(rr)) else None,
+                        "temp_c": float(tc) if (tc is not None and isfinite(tc)) else None,
+                        "pulse_active": bool(pf)
                     }
-                    for t,i,v,r,temp,flag in zip(
-        self.log_t, self.log_i, self.log_v, self.log_r,
-        self.log_temp, self.log_pulse_flag
-    )
+                    for ts_, ia, vv, rr, tc, pf in zip(t,i,v,r,temp,flag)
                 ],
-                "pulse_events": self._serialize_pulse_events()
+                "pulse_events": self._serialize_pulse_events(events)
             }
-            with open(path, "w") as f:
-                json.dump(payload, f, indent=2)
+
+            _atomic_write(path, json.dumps(payload, indent=2).encode("utf-8"))
             QMessageBox.information(self, "Save JSON", f"Saved JSON:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Save JSON", f"Failed to save JSON:\n{e}")
 
-    def _serialize_pulse_events(self):
+    def _serialize_pulse_events(self, events=None):
         # Ensure we export numeric types + include any slopes already computed
+        if events is None:
+            events = self.pulse_events
         out = []
-        for ev in self.pulse_events:
+        for ev in events:
             out.append({
                 "start_time_s": float(ev.get("start_time")) if ev.get("start_time") is not None else None,
                 "end_time_s": float(ev.get("end_time")) if ev.get("end_time") is not None else None,
@@ -885,7 +944,7 @@ class SMUGUI(QWidget):
     def _reset_plots(self):
         self.t_buf.clear(); self.i_buf.clear(); self.v_buf.clear(); self.r_buf.clear()
         self.temp_buf.clear(); self.temp_filter_buf.clear(); self.pulse_flag_buf.clear()
-        self.curve_i.setData([],[]); self.curve_t.setData([],[])
+        self.curve_i.setData([],[]); self.curve_t.setData([] ,[])
 
         self.pulse_events.clear()
         self.slope_times.clear(); self.slope_values.clear()
@@ -908,3 +967,4 @@ class SMUGUI(QWidget):
 
 if __name__=="__main__":
     app=QApplication(sys.argv); gui=SMUGUI(); gui.show(); sys.exit(app.exec_())
+
