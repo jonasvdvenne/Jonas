@@ -1,0 +1,20 @@
+name: temp_cycle
+steps:
+  - target_temp_c: 30
+    duration_s: 30
+    pulses: false
+  - target_temp_c: 40
+    duration_s: 60
+    pulses: true
+    pulse_power_w: 0.2
+    pulse_duration_s: 0.05
+    pulse_period_s: 1.0
+  - target_temp_c: 60
+    duration_s: 80
+    pulses: false
+  - target_temp_c: 30
+    duration_s: 90
+    pulses: true
+    pulse_power_w: 0.5
+    pulse_duration_s: 0.1
+    pulse_period_s: 0.5

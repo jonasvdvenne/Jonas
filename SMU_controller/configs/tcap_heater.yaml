@@ -1,0 +1,12 @@
+name: TCAP_Heater
+description: Default profile used previously for TCAP heater.
+temp_filter_window: 10
+deriv_clip: 50.0
+int_clip: 1000.0
+post_pulse_cooldown_s: 1.0
+post_pulse_drop_limit: 0.02
+alpha: 0.00381
+bands:
+  - { abs_error_gt: 10.0, Kp: 0.00120, Ki: 0.00002, Kd: 0.00120 }
+  - { abs_error_gt: 5.0,  Kp: 0.00080, Ki: 0.00002, Kd: 0.00090 }
+  - { abs_error_gt: 0.0,  Kp: 0.00025, Ki: 0.000001, Kd: 0.00035 }

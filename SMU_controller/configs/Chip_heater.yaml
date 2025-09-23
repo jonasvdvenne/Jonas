@@ -1,0 +1,21 @@
+name: chip_heater
+description: null
+temp_filter_window: 100
+deriv_clip: 50.0
+int_clip: 500.0
+post_pulse_cooldown_s: 1.0
+post_pulse_drop_limit: 0.005
+alpha: 0.002212
+bands:
+- abs_error_gt: 10.0
+  Kp: 1.5e-05
+  Ki: 4.0e-07
+  Kd: 1.5e-05
+- abs_error_gt: 5.0
+  Kp: 1.0e-05
+  Ki: 4.0e-07
+  Kd: 1.2e-05
+- abs_error_gt: 0.0
+  Kp: 3.0e-06
+  Ki: 5.0e-07
+  Kd: 4.0e-06
